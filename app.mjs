@@ -18,8 +18,9 @@ import path from "node:path";
 import { spawn } from "node:child_process";
 import { fileURLToPath } from "node:url";
 import * as cfgStore from "./config.mjs";
-import { startBridge } from "./core.mjs";
-import { checkToken, findBrowser, checkLogin } from "./verify.mjs";
+// core.mjs（supabase-js）和 verify.mjs（playwright-core）刻意**不在這裡 import**：
+// 那兩包載進來要好幾秒，而「把視窗開起來」只需要 node:http。
+// 先讓使用者看到畫面，這些等到真的要用時再動態載入。
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 const DEFAULTS = {
@@ -30,7 +31,7 @@ const DEFAULTS = {
 
 // ── 狀態（畫面每 1.2 秒來問一次） ──
 const S = {
-  screen: "setup",       // setup | checking | running
+  screen: "boot",        // boot | setup | checking | running（boot＝還在判斷有沒有設定）
   status: "idle",        // idle | connecting | online | offline | duplicate
   busy: false,
   task: "",
@@ -54,6 +55,7 @@ async function connect(cfg) {
   S.screen = "running";
   S.config = publicConfig(cfg);
   try {
+    const { startBridge } = await import("./core.mjs");
     bridge = await startBridge({
       cfg,
       onLog: (l) => pushLog(l),
@@ -79,6 +81,7 @@ async function runSetup(input) {
   const fail = (i, msg) => { steps[i].status = "fail"; S.setup.error = msg; };
 
   try {
+    const { checkToken, findBrowser, checkLogin } = await import("./verify.mjs");
     steps[0].status = "run";
     try { await checkToken(cfg); steps[0].status = "done"; }
     catch (e) { return fail(0, "網站不接受這組 email／授權碼：" + (e?.message || e)); }
@@ -189,23 +192,29 @@ if (already) {
   setTimeout(() => process.exit(0), 2500);
 }
 
-server.listen(Number(process.env.EFBRIDGE_PORT) || 0, "127.0.0.1", async () => {
+server.listen(Number(process.env.EFBRIDGE_PORT) || 0, "127.0.0.1", () => {
   if (already) return;
   const port = server.address().port;
   writeLock(port);
 
-  // 有設定就直接連線，沒有就停在設定畫面
-  if (cfgStore.exists()) {
+  // ⚠️ 順序很重要：**先把視窗開起來**，再去連線。
+  // 之前是先連線才開視窗，結果使用者點下去要等 10 秒以上才看到任何東西
+  // （讀設定要解密、驗授權碼要打伺服器、Realtime 要連上），
+  // 中間毫無反應，大家都以為沒點到就再點一次。
+  openWindow(port);
+
+  // 有設定就接著連線（畫面會自己從「連線中」變「已上線」）；沒設定就停在設定畫面
+  if (!cfgStore.exists()) { S.screen = "setup"; return; }
+  S.status = "connecting";
+  (async () => {
     try {
       const cfg = cfgStore.load();
       await connect(cfg);
-    } catch (e) {
+    } catch {
       S.screen = "setup";
       pushLog({ text: "舊設定讀不出來（換過電腦或 Windows 帳號？）請重新設定。", kind: "warn", at: Date.now() });
     }
-  }
-
-  openWindow(port);
+  })();
 });
 
 function openWindow(port) {

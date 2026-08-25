@@ -225,6 +225,15 @@ async function api(path, body) {
   return r.json();
 }
 
+/* ── 剛啟動、還在判斷要顯示什麼 ── */
+function drawBoot() {
+  if (view === "boot") return;
+  view = "boot";
+  document.getElementById("main").innerHTML =
+    '<p class="lead"><span class="spin">◐</span>&nbsp; 啟動中…</p>';
+  document.getElementById("footer").innerHTML = "";
+}
+
 /* ── 設定畫面 ── */
 function drawSetup(st) {
   if (view === "setup") return;
@@ -334,7 +343,8 @@ function drawRunning(st) {
 function drawPill(st) {
   const p = document.getElementById("pill"), t = document.getElementById("pillTxt");
   let cls = "", txt = "啟動中";
-  if (st.screen === "setup") { txt = "還沒設定"; }
+  if (st.screen === "boot") { txt = "啟動中"; }
+  else if (st.screen === "setup") { txt = "還沒設定"; }
   else if (st.screen === "checking") { txt = "檢查中"; cls = "busy"; }
   else if (st.busy) { txt = st.task || "處理中"; cls = "busy"; }
   else if (st.status === "online") { txt = "已上線"; cls = "online"; }
@@ -349,7 +359,8 @@ async function tick() {
   try {
     const st = await api("/state");
     drawPill(st);
-    if (st.screen === "setup") drawSetup(st);
+    if (st.screen === "boot") drawBoot();
+    else if (st.screen === "setup") drawSetup(st);
     else if (st.screen === "checking") drawChecking(st);
     else drawRunning(st);
   } catch { /* 主程式關了，下一輪再試 */ }

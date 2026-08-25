@@ -33,7 +33,6 @@ Write-Host "== 複製程式檔 =="
 $files = @(
   "開始使用.bat",         # 使用者唯一要點的東西（第一次）
   "EasyFlow_bridge.vbs",  # 實際的隱藏啟動器，由上面那支叫起來
-  "app.ico",              # 桌面捷徑的圖示
   "app.mjs",             # 視窗介面
   "ui.html",
   "logo.png",
