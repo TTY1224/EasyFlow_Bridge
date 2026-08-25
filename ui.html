@@ -1,0 +1,268 @@
+<!doctype html>
+<html lang="zh-Hant">
+<head>
+<meta charset="utf-8">
+<title>EasyFlow 橋接</title>
+<style>
+  :root {
+    --bg: #14161c; --bg2: #1b1e26; --bg3: #232733;
+    --line: #2c313d; --t1: #eef1f6; --t2: #a8b0c0; --t3: #6f7787;
+    --accent: #4f8ef7; --ok: #37c98a; --warn: #f0b429; --err: #f0605d;
+  }
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body {
+    font: 13px/1.6 "Segoe UI", "Microsoft JhengHei", system-ui, sans-serif;
+    background: var(--bg); color: var(--t1);
+    height: 100vh; display: flex; flex-direction: column; overflow: hidden;
+    -webkit-user-select: none; user-select: none;
+  }
+
+  header {
+    padding: 16px 22px 14px; border-bottom: 1px solid var(--line);
+    display: flex; align-items: center; gap: 12px; background: var(--bg2);
+  }
+  header img { width: 32px; height: 32px; border-radius: 8px; }
+  .htxt h1 { font-size: 15px; font-weight: 700; letter-spacing: .2px; }
+  .htxt p { font-size: 11px; color: var(--t3); }
+  .pill {
+    margin-left: auto; display: inline-flex; align-items: center; gap: 7px;
+    padding: 6px 13px; border-radius: 99px; font-size: 12px; font-weight: 600;
+    background: var(--bg3); color: var(--t2);
+  }
+  .dot { width: 8px; height: 8px; border-radius: 50%; background: var(--t3); }
+  .pill.online { color: var(--ok); } .pill.online .dot { background: var(--ok); animation: pulse 2s infinite; }
+  .pill.busy { color: var(--accent); } .pill.busy .dot { background: var(--accent); animation: pulse .9s infinite; }
+  .pill.err { color: var(--err); } .pill.err .dot { background: var(--err); }
+  @keyframes pulse { 0%, 100% { opacity: 1; } 50% { opacity: .35; } }
+
+  main { flex: 1; overflow-y: auto; padding: 20px 22px; }
+
+  /* ── 設定畫面 ── */
+  .intro { font-size: 12px; color: var(--t3); line-height: 1.8; margin-bottom: 18px; }
+  .intro b { color: var(--t2); }
+  .fld { margin-bottom: 14px; }
+  .fld label { display: block; font-size: 12px; font-weight: 600; margin-bottom: 5px; }
+  .fld .hint { font-size: 11px; color: var(--t3); font-weight: 400; margin-top: 3px; line-height: 1.6; }
+  .fld .hint a { color: var(--accent); }
+  input {
+    width: 100%; padding: 10px 12px; border-radius: 9px; border: 1px solid var(--line);
+    background: var(--bg3); color: var(--t1); font: inherit; outline: none;
+    -webkit-user-select: text; user-select: text;
+  }
+  input:focus { border-color: var(--accent); }
+  button {
+    padding: 11px 20px; border-radius: 9px; border: 0; background: var(--accent);
+    color: #fff; font: inherit; font-weight: 700; cursor: pointer;
+  }
+  button:disabled { opacity: .5; cursor: default; }
+  button.ghost { background: transparent; border: 1px solid var(--line); color: var(--t2); font-weight: 500; }
+  .row { display: flex; gap: 9px; align-items: center; margin-top: 18px; }
+  .err {
+    margin-top: 14px; padding: 11px 13px; border-radius: 9px; font-size: 12px; line-height: 1.7;
+    background: rgba(240, 96, 93, .12); color: #ffb3b1;
+  }
+
+  /* ── 檢查進度 ── */
+  .steps { margin-top: 18px; }
+  .step { display: flex; align-items: center; gap: 10px; padding: 8px 0; font-size: 13px; color: var(--t3); }
+  .step .ic { width: 18px; text-align: center; font-size: 13px; }
+  .step.run { color: var(--t1); } .step.done { color: var(--ok); } .step.fail { color: var(--err); }
+  .spin { display: inline-block; animation: spin 1s linear infinite; }
+  @keyframes spin { to { transform: rotate(360deg); } }
+
+  /* ── 執行中畫面 ── */
+  .who { padding: 14px 16px; border-radius: 11px; background: var(--bg2); margin-bottom: 16px; }
+  .who div { display: flex; justify-content: space-between; font-size: 12px; padding: 3px 0; }
+  .who span { color: var(--t3); } .who b { color: var(--t2); font-weight: 600; -webkit-user-select: text; user-select: text; }
+  .note {
+    padding: 11px 14px; border-radius: 10px; font-size: 12px; line-height: 1.7; margin-bottom: 16px;
+    background: rgba(240, 180, 41, .1); color: #f5cf7a;
+  }
+  .logh { font-size: 11px; font-weight: 700; color: var(--t3); letter-spacing: .6px; margin-bottom: 7px; }
+  .log {
+    border-radius: 10px; background: #101217; border: 1px solid var(--line);
+    padding: 10px 13px; max-height: 40vh; overflow-y: auto;
+    font-size: 12px; line-height: 1.85;
+    -webkit-user-select: text; user-select: text;
+  }
+  .log .ln { display: flex; gap: 9px; }
+  .log .tm { color: #4a5060; flex: 0 0 auto; }
+  .log .tx { color: var(--t2); word-break: break-word; }
+  .log .ok .tx { color: var(--ok); } .log .err .tx { color: var(--err); }
+  .log .warn .tx { color: var(--warn); } .log .task .tx { color: var(--accent); }
+  .log .empty { color: var(--t3); }
+
+  footer { padding: 12px 22px; border-top: 1px solid var(--line); display: flex; gap: 9px; background: var(--bg2); }
+  footer .sp { margin-left: auto; }
+  ::-webkit-scrollbar { width: 9px; }
+  ::-webkit-scrollbar-thumb { background: #333846; border-radius: 9px; }
+</style>
+</head>
+<body>
+<header>
+  <img id="logo" alt="">
+  <div class="htxt">
+    <h1>EasyFlow 橋接</h1>
+    <p>幫你填假單，但不會替你送出</p>
+  </div>
+  <div class="pill" id="pill"><span class="dot"></span><span id="pillTxt">啟動中</span></div>
+</header>
+
+<main id="main"></main>
+<footer id="footer"></footer>
+
+<script>
+const $ = (h) => { const d = document.createElement("div"); d.innerHTML = h.trim(); return d.firstChild; };
+const esc = (s) => String(s).replace(/[&<>"]/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[c]));
+const hhmm = (ts) => new Date(ts).toTimeString().slice(0, 8);
+
+let view = "";          // 目前畫的是哪個畫面，避免每次輪詢都重畫把輸入框清掉
+let logCount = -1;
+
+async function api(path, body) {
+  const r = await fetch(path, body ? {
+    method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body),
+  } : undefined);
+  return r.json();
+}
+
+/* ── 設定畫面 ── */
+function drawSetup(st) {
+  if (view === "setup") return;
+  view = "setup";
+  document.getElementById("main").innerHTML = `
+    <p class="intro">
+      這支程式會在<b>你自己的電腦</b>上幫你填 EasyFlow 的假單，填完停下來等你檢查。<br>
+      <b>它永遠不會替你按送簽。</b>你的公司密碼只存在這台電腦，用 Windows 內建的加密鎖住，網站看不到。
+    </p>
+    <div class="fld">
+      <label>① 數據網站的登入 email</label>
+      <input id="f_email" type="email" placeholder="you@wanin.tw" autocomplete="off">
+    </div>
+    <div class="fld">
+      <label>② 授權碼</label>
+      <input id="f_token" type="text" placeholder="從網站複製過來" autocomplete="off">
+      <div class="hint">在數據網站打開「請假橋接設定」那一頁就有，按複製貼過來。<a href="#" id="openSetup">幫我開那一頁</a></div>
+    </div>
+    <div class="fld">
+      <label>③ EasyFlow 帳號</label>
+      <input id="f_user" type="text" placeholder="簽單系統的帳號，不是 email" autocomplete="off">
+    </div>
+    <div class="fld">
+      <label>④ EasyFlow 密碼</label>
+      <input id="f_pass" type="password" placeholder="只會存在這台電腦" autocomplete="off">
+    </div>
+    <div class="row"><button id="go">檢查並儲存</button></div>
+    <div id="msg"></div>`;
+  document.getElementById("footer").innerHTML = "";
+
+  const cur = st.config || {};
+  if (cur.email) document.getElementById("f_email").value = cur.email;
+  if (cur.easyflowUser) document.getElementById("f_user").value = cur.easyflowUser;
+
+  document.getElementById("openSetup").onclick = (e) => { e.preventDefault(); api("/open-setup-page", {}); };
+  document.getElementById("go").onclick = submit;
+  for (const id of ["f_email", "f_token", "f_user", "f_pass"]) {
+    document.getElementById(id).addEventListener("keydown", (e) => { if (e.key === "Enter") submit(); });
+  }
+}
+
+async function submit() {
+  const body = {
+    email: document.getElementById("f_email").value.trim(),
+    token: document.getElementById("f_token").value.trim(),
+    easyflowUser: document.getElementById("f_user").value.trim(),
+    easyflowPass: document.getElementById("f_pass").value,
+  };
+  const msg = document.getElementById("msg");
+  if (!body.email.includes("@")) { msg.innerHTML = '<div class="err">第 ① 個欄位看起來不像 email</div>'; return; }
+  if (body.token.length < 20) { msg.innerHTML = '<div class="err">授權碼看起來太短，應該有 30 幾個字</div>'; return; }
+  if (!body.easyflowUser || !body.easyflowPass) { msg.innerHTML = '<div class="err">EasyFlow 的帳號或密碼還沒填</div>'; return; }
+  msg.innerHTML = "";
+  document.getElementById("go").disabled = true;
+  await api("/setup", body);
+  view = "";      // 讓輪詢重畫成「檢查進度」
+}
+
+/* ── 檢查進度 ── */
+const STEP_ICON = { wait: "○", run: '<span class="spin">◐</span>', done: "✓", fail: "✕" };
+function drawChecking(st) {
+  view = "checking";
+  const s = st.setup;
+  document.getElementById("main").innerHTML = `
+    <p class="intro">檢查中，大概 20～30 秒。過程中會閃一下瀏覽器視窗，那是在測登入，正常的。</p>
+    <div class="steps">${s.steps.map((x) => `
+      <div class="step ${x.status}"><span class="ic">${STEP_ICON[x.status] || "○"}</span><span>${esc(x.name)}</span></div>
+    `).join("")}</div>
+    ${s.error ? `<div class="err">${esc(s.error)}</div>
+      <div class="row"><button id="back">回去改</button></div>` : ""}`;
+  if (s.error) document.getElementById("back").onclick = () => { api("/setup-reset", {}); view = ""; };
+}
+
+/* ── 執行中畫面 ── */
+function drawRunning(st) {
+  if (view !== "running") {
+    view = "running";
+    document.getElementById("main").innerHTML = `
+      <div class="who">
+        <div><span>你的帳號</span><b>${esc(st.config.email || "")}</b></div>
+        <div><span>EasyFlow 帳號</span><b>${esc(st.config.easyflowUser || "")}</b></div>
+        <div><span>用哪個瀏覽器</span><b>${st.config.browser === "chrome" ? "Chrome" : "Edge"}</b></div>
+      </div>
+      <div class="note">這個視窗要留著開，關掉就等於下線。回網站跟 Woby 說話就可以了。</div>
+      <div class="logh">動態</div>
+      <div class="log" id="log"></div>`;
+    document.getElementById("footer").innerHTML = `
+      <button class="ghost" id="reset">重新設定</button>
+      <button class="ghost sp" id="quit">結束</button>`;
+    document.getElementById("reset").onclick = () => {
+      if (confirm("重新設定？\n\n現在的設定會被清掉，要重新輸入帳密。")) { api("/setup-reset", { wipe: true }); view = ""; }
+    };
+    document.getElementById("quit").onclick = () => { api("/quit", {}); document.body.innerHTML =
+      '<div style="display:flex;height:100vh;align-items:center;justify-content:center;color:#6f7787">已結束，可以關掉這個視窗了</div>'; };
+    logCount = -1;
+  }
+  if (st.log.length !== logCount) {
+    logCount = st.log.length;
+    const el = document.getElementById("log");
+    el.innerHTML = st.log.length
+      ? st.log.map((l) => `<div class="ln ${l.kind}"><span class="tm">${hhmm(l.at)}</span><span class="tx">${esc(l.text)}</span></div>`).join("")
+      : '<div class="empty">還沒有動作。到網站上跟 Woby 說「幫我請假」試試。</div>';
+    el.scrollTop = el.scrollHeight;
+  }
+}
+
+/* ── 狀態列 ── */
+function drawPill(st) {
+  const p = document.getElementById("pill"), t = document.getElementById("pillTxt");
+  let cls = "", txt = "啟動中";
+  if (st.screen === "setup") { txt = "還沒設定"; }
+  else if (st.screen === "checking") { txt = "檢查中"; cls = "busy"; }
+  else if (st.busy) { txt = st.task || "處理中"; cls = "busy"; }
+  else if (st.status === "online") { txt = "已上線"; cls = "online"; }
+  else if (st.status === "connecting") { txt = "連線中"; }
+  else if (st.status === "duplicate") { txt = "重複開啟"; cls = "err"; }
+  else if (st.status === "offline") { txt = "離線"; cls = "err"; }
+  p.className = "pill " + cls;
+  t.textContent = txt;
+}
+
+async function tick() {
+  try {
+    const st = await api("/state");
+    drawPill(st);
+    if (st.screen === "setup") drawSetup(st);
+    else if (st.screen === "checking") drawChecking(st);
+    else drawRunning(st);
+  } catch { /* 主程式關了，下一輪再試 */ }
+}
+
+// 視窗關掉的時候通知主程式收工（沒有小黑窗，這是使用者唯一的關閉方式）
+addEventListener("pagehide", () => { try { navigator.sendBeacon("/bye"); } catch {} });
+
+fetch("/logo").then((r) => r.text()).then((d) => { document.getElementById("logo").src = d; }).catch(() => {});
+tick();
+setInterval(tick, 1200);
+</script>
+</body>
+</html>
