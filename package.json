@@ -1,0 +1,19 @@
+{
+  "name": "easyflow-bridge",
+  "version": "1.0.0",
+  "private": true,
+  "description": "在自己電腦上幫忙填 EasyFlow 簽核單的本機橋接程式（只填不送出）",
+  "type": "module",
+  "scripts": {
+    "setup": "node setup.mjs",
+    "start": "node bridge.mjs"
+  },
+  "dependencies": {
+    "@supabase/supabase-js": "^2.58.0",
+    "playwright-core": "^1.61.0",
+    "ws": "^8.18.0"
+  },
+  "engines": {
+    "node": ">=20"
+  }
+}
