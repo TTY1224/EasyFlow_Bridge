@@ -42,6 +42,8 @@ const LOG_MAX = 200;
 const pushLog = (l) => { S.log.push(l); if (S.log.length > LOG_MAX) S.log.splice(0, S.log.length - LOG_MAX); };
 
 let bridge = null;
+let lastPing = Date.now();   // 介面最後一次來問狀態的時間（用來判斷視窗還在不在）
+let quitting = false;
 
 function publicConfig(c) {
   // 畫面只需要這些。密碼跟授權碼不往外送 —— 就算只是傳給自己的 localhost 也沒必要。
@@ -100,6 +102,37 @@ async function runSetup(input) {
   }
 }
 
+// ── 同一台電腦只跑一份 ──
+// 常見情況：先點了「開始使用.bat」開一個視窗，後來又點桌面捷徑 —— 就會變成兩份，
+// 兩份搶同一組 EasyFlow 登入會兩邊都失敗。所以第二次啟動不要自己跑，
+// 直接把「已經在跑的那一份」的視窗叫出來就好。
+const LOCK = path.join(cfgStore.DIR, "running.json");
+
+async function findRunning() {
+  try {
+    const j = JSON.parse(fs.readFileSync(LOCK, "utf8"));
+    if (!j?.port) return null;
+    // 真的去問它一聲，光看 pid 不準（pid 可能被別的程式重用）
+    const r = await fetch(`http://127.0.0.1:${j.port}/state`, { signal: AbortSignal.timeout(1500) });
+    if (r.ok) { await r.json(); return j; }
+  } catch { /* 沒有、讀不到、或死掉了 —— 都當成沒有 */ }
+  return null;
+}
+
+function writeLock(port) {
+  try {
+    fs.mkdirSync(cfgStore.DIR, { recursive: true });
+    fs.writeFileSync(LOCK, JSON.stringify({ pid: process.pid, port }), "utf8");
+  } catch { /* 寫不進去也還是能跑，只是失去單一實例保護 */ }
+}
+
+function clearLock() {
+  try {
+    const j = JSON.parse(fs.readFileSync(LOCK, "utf8"));
+    if (j?.pid === process.pid) fs.unlinkSync(LOCK);   // 別刪到別人的
+  } catch { /* ignore */ }
+}
+
 // ── 小伺服器 ──
 const readBody = (req) => new Promise((res) => {
   let b = "";
@@ -149,8 +182,17 @@ const server = http.createServer(async (req, res) => {
 
 // 只聽 127.0.0.1，別人連不進來。port 交給系統挑，避免撞到別的程式。
 // （EFBRIDGE_PORT 只是開發時要固定 port 好測試用，正常不會設。）
+const already = await findRunning();
+if (already) {
+  // 已經有一份在跑：把它的視窗叫出來，自己安靜退場（不要印錯誤嚇人）
+  openWindow(already.port);
+  setTimeout(() => process.exit(0), 2500);
+}
+
 server.listen(Number(process.env.EFBRIDGE_PORT) || 0, "127.0.0.1", async () => {
+  if (already) return;
   const port = server.address().port;
+  writeLock(port);
 
   // 有設定就直接連線，沒有就停在設定畫面
   if (cfgStore.exists()) {
@@ -200,13 +242,12 @@ function openWindow(port) {
   }, 15000).unref();
 }
 
-let lastPing = Date.now();
-let quitting = false;
 async function shutdown() {
   if (quitting) return;
   quitting = true;
   try { await bridge?.stop(); } catch { /* ignore */ }
   try { server.close(); } catch { /* ignore */ }
+  clearLock();
   setTimeout(() => process.exit(0), 300);
 }
 

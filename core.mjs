@@ -129,7 +129,7 @@ export async function startBridge({ cfg, onLog = () => {}, onState = () => {} })
       if (others > 0 && !stopped) {
         stopped = true;
         onState({ status: "duplicate" });
-        log("這個橋接已經在另一個視窗跑了。兩份一起跑會搶同一組 EasyFlow 登入而失敗，所以這一份停下來。", "err");
+        log("偵測到你的橋接已經在別的地方跑著了（另一個視窗，或命令列版）。兩份一起跑會搶同一組 EasyFlow 登入而兩邊都失敗，所以這一份先停下來。把多的那個關掉就好。", "err");
         try { supa.removeChannel(channel); } catch { /* ignore */ }
       }
     })
