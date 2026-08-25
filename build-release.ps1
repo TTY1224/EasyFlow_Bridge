@@ -31,8 +31,9 @@ Pop-Location
 
 Write-Host "== 複製程式檔 =="
 $files = @(
-  "EasyFlow 橋接.vbs",   # 使用者唯一要點的東西
-  "app.ico",             # 桌面捷徑的圖示
+  "開始使用.bat",         # 使用者唯一要點的東西（第一次）
+  "EasyFlow_bridge.vbs",  # 實際的隱藏啟動器，由上面那支叫起來
+  "app.ico",              # 桌面捷徑的圖示
   "app.mjs",             # 視窗介面
   "ui.html",
   "logo.png",
@@ -43,8 +44,7 @@ $files = @(
   "verify.mjs",
   "setup.mjs",
   "package.json",
-  "README.md",
-  "啟動.bat"          # exe 被防毒或 SmartScreen 擋掉時的備用啟動方式
+  "README.md"
 )
 foreach ($f in $files) { Copy-Item (Join-Path $root $f) -Destination $stage }
 Copy-Item (Join-Path $root "node_modules") -Destination (Join-Path $stage "node_modules") -Recurse
@@ -67,4 +67,4 @@ Compress-Archive -Path $stage -DestinationPath $zip -Force
 $mb = [math]::Round((Get-Item $zip).Length / 1MB, 1)
 Write-Host ""
 Write-Host "完成： $zip  ($mb MB)" -ForegroundColor Green
-Write-Host "解壓後點「EasyFlow 橋接.vbs」就好（第一次會自動在桌面放捷徑）。"
+Write-Host "解壓後點「開始使用.bat」就好（它會解除下載封鎖並在桌面放捷徑）。"
