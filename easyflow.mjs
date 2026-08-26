@@ -18,6 +18,26 @@ const HEADLESS = false;
  * 掛好時就被點到，症狀是「按鈕找不到」或「假別沒選中」。 */
 const SLOW_MO = 250;
 
+/* 等到條件成立（或逾時）。
+ *
+ * 這支系統每一步都要等它跑完，本來全用固定 sleep（開單 13 秒、存檔 13 秒…），
+ * 一個人加起來 55 秒以上、8 個人要 8 分鐘。但那些數字是抓「最壞情況」，
+ * 平常 2~3 秒就好。改成輪詢條件之後大部分步驟都是秒級完成。
+ *
+ * fn 回 truthy 就結束；丟例外當成「還沒好」（frame 重載時讀欄位會炸，很正常）。 */
+async function until(fn, { timeout = 30000, step = 400, page = null } = {}) {
+  const t0 = Date.now();
+  for (;;) {
+    try {
+      const v = await fn();
+      if (v) return v;
+    } catch { /* 還沒好，再等 */ }
+    if (Date.now() - t0 > timeout) return null;
+    if (page) await page.waitForTimeout(step);
+    else await new Promise((r) => setTimeout(r, step));
+  }
+}
+
 /* 表單清單。
  *
  * ⚠️ 不要用 banner 上那排快捷按鈕（#tdMenu_1…）—— **那排是每個人自己排的**，
@@ -141,25 +161,55 @@ export async function login({ cfg, say = () => {}, browserChannel }) {
 /* 開一張空白表單分頁。已經開過同一張時，系統會問「頁籤已存在要不要重載」，
  * dialog handler 會自動接受 —— 所以重複呼叫會重用同一個分頁、內容清空，
  * 分頁不會愈開愈多（實測過）。 */
-export async function openFormTab({ page, tree, form = "leave", say = () => {} }) {
+export async function openFormTab({ page, tree, form = "leave", say = () => {}, prevFp = null }) {
   const f = FORMS[form] || FORMS.leave;
   say(`開啟${f.label}單…`);
+
+  // ⚠️ 一定要從外層 frame 往下找 framePlus。
+  // 同時開多張表單分頁時會有多個同名的 framePlus，用 page.frames() 找會抓到別張單。
+  const pick = () => {
+    const outer = page.frames().find((x) => x.name() === "frame" + f.formId);
+    if (!outer) return null;
+    const fp = outer.childFrames().find((x) => x.name() === "framePlus")
+      || outer.childFrames().flatMap((c) => c.childFrames()).find((x) => x.name() === "framePlus");
+    return fp ? { outer, fp } : null;
+  };
+
+  // 重開之前先記住舊的 framePlus，等一下要確認拿到的是「新的」那個。
+  const beforeFp = prevFp || (pick() ? pick().fp : null);
 
   // 只能透過系統自己的 createTab 開單。直接 goto 表單網址會被踢「Session過期」。
   await tree.evaluate(({ url, formId, title }) => {
     if (typeof createTab !== "function") throw new Error("這個頁面沒有 createTab");
     createTab(url, formId, title, "107");
   }, { url: f.url, formId: f.formId, title: f.title });
-  await page.waitForTimeout(13000);
 
-  // ⚠️ 一定要從外層 frame 往下找 framePlus。
-  // 同時開多張表單分頁時會有多個同名的 framePlus，用 page.frames() 找會抓到別張單。
-  const outer = page.frames().find((x) => x.name() === "frame" + f.formId);
-  if (!outer) throw new Error(`${f.label}單沒有開起來`);
-  const fp = outer.childFrames().find((x) => x.name() === "framePlus")
-    || outer.childFrames().flatMap((c) => c.childFrames()).find((x) => x.name() === "framePlus");
-  if (!fp) throw new Error(`${f.label}單的內容沒有載入`);
-  return { fp, outer, form: f };
+  // ⚠️ 這 3 秒不能省：系統會先問「頁籤已存在要不要重載」（dialog handler 自動接受），
+  // 重載才開始。太早去抓 frame 會抓到「還沒被換掉的舊表單」，
+  // 之後點放大鏡完全沒反應（症狀：「選人視窗沒有開起來」）。踩過。
+  await page.waitForTimeout(3000);
+
+  // 等到「重載後的新 framePlus，而且是一張空白單」。
+  // 條件連續成立兩次才算 —— 載入中途讀得到值但馬上又被換掉。
+  let lastFp = null;
+  let stable = 0;
+  const got = await until(async () => {
+    const t = pick();
+    if (!t || t.fp.isDetached()) { stable = 0; return null; }
+    if (beforeFp && t.fp === beforeFp) { stable = 0; return null; }   // 還是舊的，reload 還沒完成
+    const person = await t.fp.inputValue(`#${f.f.person}_txt`);
+    if (!person) { stable = 0; return null; }
+    const hours = await t.fp.inputValue(`#${f.f.hours}_txt`);
+    if (hours) { stable = 0; return null; }                            // 上一張單還沒清掉
+    if (lastFp === t.fp) stable += 1; else { lastFp = t.fp; stable = 0; }
+    return stable >= 2 ? t : null;
+  }, { timeout: 45000, step: 400, page });
+
+  if (!got) {
+    if (!pick()) throw new Error(`${f.label}單沒有開起來`);
+    throw new Error(`${f.label}單一直沒有變成空白表單`);
+  }
+  return { fp: got.fp, outer: got.outer, form: f };
 }
 
 /* 登入並開好指定的表單分頁（單張作業用）。 */
@@ -174,6 +224,18 @@ export async function openForm({ cfg, form = "leave", say = () => {}, browserCha
   }
 }
 
+/* 讀選人視窗目前這一頁的清單。挑列數最多的 table —— 這種舊系統常用 table 排版。 */
+function readRowsRaw(dlg) {
+  return dlg.evaluate(() => {
+    const t = Array.from(document.querySelectorAll("table")).sort((a, b) => b.rows.length - a.rows.length)[0];
+    if (!t) return [];
+    return Array.from(t.querySelectorAll("tr")).slice(1)
+      .map((tr) => Array.from(tr.querySelectorAll("td")).map((td) => (td.innerText || "").trim()))
+      .filter((c) => c.length > 2 && /^\d+$/.test(c[0] || ""))
+      .map((c) => ({ no: c[0], name: c[1], dep: c[4] || "" }));
+  });
+}
+
 /* 在「請假人／調休人」的放大鏡視窗裡挑一個人（用姓名比對）。
  *
  * ⚠️ 不要去切「資料查詢條件」那個下拉（ddlSEARCH）。它是 AutoPostBack，
@@ -183,6 +245,9 @@ export async function openForm({ cfg, form = "leave", say = () => {}, browserCha
 async function pickPerson({ page, fp, form, name, say = () => {} }) {
   say(`選人：${name}…`);
   await fp.click(`#${form.f.person}_btn_icon`, { force: true });
+  // ⚠️ 這裡刻意用固定等待。試過改成「輪詢到搜尋框出現」，但這個對話框
+  // 是在 iframe 裡慢慢長出來的，條件判斷一直不成立、整個卡住 30 秒才逾時。
+  // 固定 6 秒反而穩，也沒差多少。
   await page.waitForTimeout(6000);
   const dlg = page.frames().find((f) => f.name() === "dialogIframe" || f.url().includes("F2Single"));
   if (!dlg) throw new Error("選人視窗沒有開起來");
@@ -190,57 +255,73 @@ async function pickPerson({ page, fp, form, name, say = () => {} }) {
   await dlg.fill("#txtSEARCH", "");
   // 查詢鈕是隱藏的（Playwright 會拒絕點），用 DOM 直接觸發
   await dlg.evaluate(() => document.getElementById("btnSEARCH").click());
-  await page.waitForTimeout(7000);
+  await page.waitForTimeout(6000);
 
-  const readRows = () => dlg.evaluate(() => {
-    const t = Array.from(document.querySelectorAll("table")).sort((a, b) => b.rows.length - a.rows.length)[0];
-    if (!t) return [];
-    return Array.from(t.querySelectorAll("tr")).slice(1)
-      .map((tr) => Array.from(tr.querySelectorAll("td")).map((td) => (td.innerText || "").trim()))
-      .filter((c) => c.length > 2 && /^\d+$/.test(c[0] || ""))
-      .map((c) => ({ no: c[0], name: c[1], dep: c[4] || "" }));
-  });
+  const readRows = () => readRowsRaw(dlg);
 
-  // 先把整份名單收齊，再決定要選誰 —— 這樣「部分比對」才能確認是不是唯一
+  // 一邊翻頁一邊找。**名字完全相符就當場選** —— 不用把所有頁翻完再回頭，
+  // 那樣一個人要多花十幾秒（8 個人就差兩分鐘）。
   const seen = [];
-  for (let pageNo = 1; pageNo <= 8; pageNo++) {
-    const rows = await readRows();
+  const gotoPage = async (n) => {
+    const link = dlg.locator("a").filter({ hasText: String(n) }).last();
+    if (!(await link.count())) return false;
+    await link.click({ force: true });
+    await page.waitForTimeout(4000);
+    return true;
+  };
+
+  const selectRow = async (row) => {
+    await dlg.locator("tr").filter({ hasText: row.name }).first().dblclick({ force: true });
+    // 等表單上的人真的換成他（選人會觸發一輪 postback 重帶部門職位）
+    await page.waitForTimeout(1500);
+    await until(async () => (await fp.inputValue(`#${form.f.person}_txt`)) === row.no,
+                { timeout: 25000, page });
+    const gotName = await fp.inputValue(`#${form.f.personName}_txt`).catch(() => "");
+    const gotNo = await fp.inputValue(`#${form.f.person}_txt`).catch(() => "");
+    if (gotNo !== row.no) throw new Error(`選人沒生效（表單上目前是「${gotNo} ${gotName}」）`);
+    return { no: gotNo, name: gotName, dep: row.dep };
+  };
+
+  let pageNo = 1;
+  for (; pageNo <= 8; pageNo++) {
+    const rows = await readRowsRaw(dlg);
     for (const r of rows) if (!seen.some((x) => x.no === r.no)) seen.push(r);
-    const next = dlg.locator("a").filter({ hasText: String(pageNo + 1) }).last();
-    if (!(await next.count())) break;
-    await next.click({ force: true });
-    await page.waitForTimeout(5000);
-  }
 
-  // 全等優先；沒有再試「名單上的名字包含使用者給的字」（例如「政澤」→「蔡政澤」）。
-  // 只有剛好一個符合才動作 —— 不確定就寧可報錯，這是公司簽核系統。
-  let hits = seen.filter((r) => r.name === name);
-  let how = "";
-  if (!hits.length) { hits = seen.filter((r) => r.name.includes(name)); how = "（用部分比對）"; }
-  if (hits.length > 1) {
-    throw new Error(`「${name}」對到 ${hits.length} 個人（${hits.map((h) => h.name).join("、")}），請給完整的本名`);
-  }
-  if (!hits.length) {
-    throw new Error(`EasyFlow 的名單裡找不到「${name}」，請用 EasyFlow 上的本名。名單上有：${seen.map((r) => r.name).join("、")}`);
-  }
-
-  const target = hits[0];
-  // 選到的人可能不在目前這一頁，回第一頁重新翻到他所在的頁
-  for (let pageNo = 1; pageNo <= 8; pageNo++) {
-    const rows = await readRows();
-    if (rows.some((r) => r.no === target.no)) {
-      await dlg.locator("tr").filter({ hasText: target.name }).first().dblclick({ force: true });
-      await page.waitForTimeout(5000);
-      const gotName = await fp.inputValue(`#${form.f.personName}_txt`).catch(() => "");
-      const gotNo = await fp.inputValue(`#${form.f.person}_txt`).catch(() => "");
-      if (gotNo !== target.no) throw new Error(`選人沒生效（表單上目前是「${gotNo} ${gotName}」）`);
-      if (how) say(`${name} → ${gotName}${how}`);
-      return { no: gotNo, name: gotName, dep: target.dep };
+    const exact = rows.filter((r) => r.name === name);
+    if (exact.length > 1) {
+      throw new Error(`這一頁就有 ${exact.length} 個「${name}」（${exact.map((h) => h.no).join("、")}），請給工號或更完整的資訊`);
     }
-    const next = dlg.locator("a").filter({ hasText: String(pageNo + 1) }).last();
-    if (!(await next.count())) break;
-    await next.click({ force: true });
-    await page.waitForTimeout(5000);
+    if (exact.length === 1) return selectRow(exact[0]);       // 完全相符 → 當場選，不再翻
+
+    if (!(await gotoPage(pageNo + 1))) break;
+  }
+
+  // 沒有完全相符 → 試「名單上的名字包含使用者給的字」（例如「冠羣」→「韋冠羣」）。
+  // 這時整份名單已經在 seen 裡了（上面每一頁都收過），可以確認是不是唯一。
+  const loose = seen.filter((r) => r.name.includes(name));
+  if (loose.length > 1) {
+    throw new Error(`「${name}」對到 ${loose.length} 個人（${loose.map((h) => h.name).join("、")}），請給完整的本名`);
+  }
+  if (!loose.length) {
+    // ⚠️ 這個清單是「照登入帳號的權限」給的，不是全公司。
+    // 實測：電競行銷部的帳號看不到電競選手部的人。所以最常見的原因不是名字打錯，
+    // 而是「這個帳號沒有權限幫這個人上單」—— 訊息一定要講清楚。
+    throw new Error(
+      `你的 EasyFlow 帳號在選人清單裡看不到「${name}」。`
+      + `這個清單是照權限給的（幫選手上單要用戰隊主管的帳號，一般同事的帳號看不到選手）。`
+      + `目前看得到的人：${seen.map((r) => r.name).join("、")}`);
+  }
+
+  const target = loose[0];
+  say(`${name} → ${target.name}（用部分比對）`);
+
+  // 上面已經翻到最後一頁了，要先回第 1 頁再往後找那個人（踩過：不回去一定翻不到）
+  await gotoPage(1);
+  for (let i = 1; i <= 8; i++) {
+    const rows = await readRowsRaw(dlg);
+    const hit = rows.find((r) => r.no === target.no);
+    if (hit) return selectRow(hit);
+    if (!(await gotoPage(i + 1))) break;
   }
   throw new Error(`翻不到「${target.name}」所在的那一頁`);
 }
@@ -285,10 +366,14 @@ async function pickLeaveType({ page, fp, form, code }) {
 /* 按「草稿儲存」。
  * ⚠️ 只按草稿儲存，永遠不按旁邊那顆「傳送」（那個是送去簽核）。
  * 為什麼要存草稿：表單是同一個分頁，不存的話沒辦法接著填下一個人。 */
-async function saveDraft({ page, outer, say = () => {} }) {
+async function saveDraft({ page, outer, notes, say = () => {} }) {
   say("草稿儲存…");
+  if (notes) notes.last = "";
   await outer.click(BTN_DRAFT, { force: true });
-  await page.waitForTimeout(13000);
+  // 系統存完會跳「儲存成功」的 alert，dialog handler 會接掉並記在 notes.last。
+  // 等那句話出現就好，不用死等 13 秒。
+  const ok = await until(() => notes && /儲存成功|成功/.test(notes.last || ""), { timeout: 40000, page });
+  if (!ok) throw new Error("按了草稿儲存但沒有看到「儲存成功」" + (notes && notes.last ? `（系統說：${notes.last}）` : "，可能沒存進去"));
 }
 
 /* 批次代填：一次幫多位同事上同一種單。
@@ -299,6 +384,7 @@ export async function fillBatch({ cfg, req, say = () => {}, onEach = () => {} })
   if (!form) throw new Error(`未知的單別：${req.form}`);
 
   const results = [];
+  let lastFp = null;      // 上一位用的 framePlus，用來確認下一位拿到的是新的
   // 只登入一次，之後每個人重開分頁就好（登入一次要 10 秒，7 個人就差 1 分鐘）
   const ses = await login({ cfg, say });
   const browser = ses.browser;
@@ -310,7 +396,11 @@ export async function fillBatch({ cfg, req, say = () => {}, onEach = () => {} })
       try {
         if (ses.notes) ses.notes.last = "";      // 上一個人的訊息不要帶到這個人身上
         // 每個人都重開一張空白單（重用同一個分頁，內容會清空）
-        tab = await openFormTab({ page: ses.page, tree: ses.tree, form: req.form, say: () => {} });
+        tab = await openFormTab({
+          page: ses.page, tree: ses.tree, form: req.form, say: () => {},
+          prevFp: lastFp,                     // 確認拿到的是重載後的新 frame，不是上一位的
+        });
+        lastFp = tab.fp;
 
         const who = await pickPerson({ page: ses.page, fp: tab.fp, form, name, say: (t) => say(`${tag} ${t}`) });
 
@@ -330,8 +420,15 @@ export async function fillBatch({ cfg, req, say = () => {}, onEach = () => {} })
         }
 
         say(`${tag} 計算時數…`);
+        if (ses.notes) ses.notes.last = "";
         await tab.fp.click("#btnCount");
-        await ses.page.waitForTimeout(6000);
+        // 等時數算出來，或系統跳訊息說算不出來（例如可休時數不足）
+        // 上限刻意壓短：算得出來通常 1~3 秒。算不出來的時候（假日、班表沒產生）
+        // 系統不一定會跳訊息，欄位就一直空著 —— 等滿 30 秒只是白等。
+        await until(async () => {
+          const h = await tab.fp.inputValue(`#${form.f.hours}_txt`);
+          return (h && parseFloat(h) > 0) || (ses.notes && ses.notes.last);
+        }, { timeout: 12000, page: ses.page });
         const hours = await tab.fp.inputValue(`#${form.f.hours}_txt`).catch(() => "");
         // 回報實際用了什麼時間（沒指定的話就是系統照班別帶的），使用者才知道填了什麼
         const usedST = await tab.fp.inputValue(`#${form.f.startT}_txt`).catch(() => "");
@@ -346,7 +443,7 @@ export async function fillBatch({ cfg, req, say = () => {}, onEach = () => {} })
             : "算出來是 0 小時 —— 那個時段沒有可以計算的上班時間（假日、連假，或班表還沒產生）");
         }
 
-        await saveDraft({ page: ses.page, outer: tab.outer, say: (t) => say(`${tag} ${t}`) });
+        await saveDraft({ page: ses.page, outer: tab.outer, notes: ses.notes, say: (t) => say(`${tag} ${t}`) });
 
         const one = { name, no: who.no, dep: who.dep, hours, startT: usedST, endT: usedET, ok: true, error: "" };
         results.push(one);
