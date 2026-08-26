@@ -201,28 +201,55 @@ async function pickPerson({ page, fp, form, name, say = () => {} }) {
       .map((c) => ({ no: c[0], name: c[1], dep: c[4] || "" }));
   });
 
+  // 先把整份名單收齊，再決定要選誰 —— 這樣「部分比對」才能確認是不是唯一
   const seen = [];
   for (let pageNo = 1; pageNo <= 8; pageNo++) {
     const rows = await readRows();
     for (const r of rows) if (!seen.some((x) => x.no === r.no)) seen.push(r);
-    const hits = rows.filter((r) => r.name === name);
-    if (hits.length > 1) {
-      throw new Error(`名單裡有 ${hits.length} 個「${name}」（${hits.map((h) => h.no).join("、")}），沒辦法判斷是哪一位`);
-    }
-    if (hits.length === 1) {
-      await dlg.locator("tr").filter({ hasText: name }).first().dblclick({ force: true });
+    const next = dlg.locator("a").filter({ hasText: String(pageNo + 1) }).last();
+    if (!(await next.count())) break;
+    await next.click({ force: true });
+    await page.waitForTimeout(5000);
+  }
+
+  // 全等優先；沒有再試「名單上的名字包含使用者給的字」（例如「政澤」→「蔡政澤」）。
+  // 只有剛好一個符合才動作 —— 不確定就寧可報錯，這是公司簽核系統。
+  let hits = seen.filter((r) => r.name === name);
+  let how = "";
+  if (!hits.length) { hits = seen.filter((r) => r.name.includes(name)); how = "（用部分比對）"; }
+  if (hits.length > 1) {
+    throw new Error(`「${name}」對到 ${hits.length} 個人（${hits.map((h) => h.name).join("、")}），請給完整的本名`);
+  }
+  if (!hits.length) {
+    throw new Error(`EasyFlow 的名單裡找不到「${name}」，請用 EasyFlow 上的本名。名單上有：${seen.map((r) => r.name).join("、")}`);
+  }
+
+  const target = hits[0];
+  // 選到的人可能不在目前這一頁，回第一頁重新翻到他所在的頁
+  for (let pageNo = 1; pageNo <= 8; pageNo++) {
+    const rows = await readRows();
+    if (rows.some((r) => r.no === target.no)) {
+      await dlg.locator("tr").filter({ hasText: target.name }).first().dblclick({ force: true });
       await page.waitForTimeout(5000);
       const gotName = await fp.inputValue(`#${form.f.personName}_txt`).catch(() => "");
       const gotNo = await fp.inputValue(`#${form.f.person}_txt`).catch(() => "");
-      if (gotName !== name) throw new Error(`選人沒生效（表單上目前是「${gotNo} ${gotName}」）`);
-      return { no: gotNo, name: gotName, dep: hits[0].dep };
+      if (gotNo !== target.no) throw new Error(`選人沒生效（表單上目前是「${gotNo} ${gotName}」）`);
+      if (how) say(`${name} → ${gotName}${how}`);
+      return { no: gotNo, name: gotName, dep: target.dep };
     }
     const next = dlg.locator("a").filter({ hasText: String(pageNo + 1) }).last();
     if (!(await next.count())) break;
     await next.click({ force: true });
     await page.waitForTimeout(5000);
   }
-  throw new Error(`EasyFlow 的名單裡找不到「${name}」。名單上有：${seen.map((r) => r.name).join("、")}`);
+  throw new Error(`翻不到「${target.name}」所在的那一頁`);
+}
+
+/* 選人視窗沒關掉的話會遮住表單，下一個人就整個做不了事。
+   關法跟假別選擇器一樣：點框裡那個「×」（Escape 沒用）。 */
+async function closePicker(page, fp) {
+  try { await fp.getByText("×", { exact: true }).first().click({ force: true, timeout: 3000 }); } catch { /* 沒開或已經關了 */ }
+  await page.waitForTimeout(1500);
 }
 
 /* 選假別（只有請假單有）。打字會被擋，只能用選擇器。 */
@@ -279,10 +306,11 @@ export async function fillBatch({ cfg, req, say = () => {}, onEach = () => {} })
     for (let i = 0; i < req.people.length; i++) {
       const name = req.people[i];
       const tag = `(${i + 1}/${req.people.length}) ${name}`;
+      let tab = null;
       try {
         if (ses.notes) ses.notes.last = "";      // 上一個人的訊息不要帶到這個人身上
         // 每個人都重開一張空白單（重用同一個分頁，內容會清空）
-        const tab = await openFormTab({ page: ses.page, tree: ses.tree, form: req.form, say: () => {} });
+        tab = await openFormTab({ page: ses.page, tree: ses.tree, form: req.form, say: () => {} });
 
         const who = await pickPerson({ page: ses.page, fp: tab.fp, form, name, say: (t) => say(`${tag} ${t}`) });
 
@@ -325,10 +353,27 @@ export async function fillBatch({ cfg, req, say = () => {}, onEach = () => {} })
         onEach(one);
         say(`${tag} ✓ 已存草稿（${usedST}~${usedET}，${hours} 小時）`);
       } catch (e) {
-        const one = { name, no: "", dep: "", hours: "", startT: "", endT: "", ok: false, error: String(e && e.message ? e.message : e).slice(0, 200) };
+        const msg = String(e && e.message ? e.message : e);
+        const one = { name, no: "", dep: "", hours: "", startT: "", endT: "", ok: false, error: msg.slice(0, 200) };
         results.push(one);
         onEach(one);
         say(`${tag} ✗ ${one.error}`);
+
+        // 瀏覽器被關掉了（使用者自己關、或當掉）就不要硬跑 ——
+        // 後面每個人都會吐一樣的莫名錯誤，看了只會更困惑。
+        if (/has been closed|Target (page|closed)/i.test(msg)) {
+          const rest = req.people.slice(i + 1);
+          for (const n of rest) {
+            const skip = { name: n, no: "", dep: "", hours: "", startT: "", endT: "", ok: false, error: "瀏覽器被關掉了，這位沒有處理到" };
+            results.push(skip);
+            onEach(skip);
+          }
+          say(`瀏覽器已經關掉，剩下的 ${rest.length} 位沒跑。請再跑一次。`);
+          break;
+        }
+
+        // 選人視窗可能還開著，會遮住下一個人的表單 —— 關掉它
+        try { await closePicker(ses.page, tab && tab.fp ? tab.fp : null); } catch { /* ignore */ }
 
         // EasyFlow 的 session 逾時了就不要硬跑下去 —— 後面每個人都會失敗，
         // 而且錯誤訊息會很莫名。直接停下來，把已完成的回報出去，叫人重跑剩下的。
