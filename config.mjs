@@ -43,6 +43,16 @@ export function exists() {
   return fs.existsSync(FILE);
 }
 
+// 只讀不機密的欄位，**不解密密碼**。
+// 解密要叫 PowerShell（約半秒），而「開視窗」這件事等不起 —— 但它需要知道
+// 使用者選了哪個瀏覽器。所以拆一個輕量版出來。
+export function peek() {
+  try {
+    const r = JSON.parse(fs.readFileSync(FILE, "utf8"));
+    return { email: r.email || "", easyflowUser: r.easyflowUser || "", browser: r.browser || "" };
+  } catch { return {}; }
+}
+
 export function load() {
   const raw = JSON.parse(fs.readFileSync(FILE, "utf8"));
   return { ...raw, easyflowPass: decrypt(raw.easyflowPassEnc) };

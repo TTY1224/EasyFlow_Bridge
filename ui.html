@@ -130,6 +130,17 @@
   button.ghost:hover { background: rgba(255, 255, 255, .05); color: var(--text-1); }
   .row { display: flex; gap: 9px; align-items: center; margin-top: 20px; }
 
+  /* 瀏覽器選擇（分段式按鈕） */
+  .seg { display: flex; gap: 0; border: 1px solid var(--fw-line); border-radius: var(--r-md); overflow: hidden; }
+  .seg button {
+    flex: 1; padding: 9px 0; border: 0; border-radius: 0;
+    background: rgba(255, 255, 255, .03); color: var(--text-2); font-weight: 500;
+  }
+  .seg button + button { border-left: 1px solid var(--fw-line); }
+  .seg button:hover { background: rgba(255, 255, 255, .07); color: var(--text-1); }
+  .seg button.on { background: var(--accent); color: #fff; font-weight: 600; }
+  .seg button.on:hover { background: var(--accent); }
+
   .err {
     margin-top: 15px; padding: 11px 13px; border-radius: var(--r-md);
     font-size: 12px; line-height: 1.7;
@@ -217,6 +228,7 @@ const hhmm = (ts) => new Date(ts).toTimeString().slice(0, 8);
 
 let view = "";          // 目前畫的是哪個畫面，避免每次輪詢都重畫把輸入框清掉
 let logCount = -1;
+let pickedBrowser = "";  // 使用者選的瀏覽器（空的就讓後端自動挑）
 
 async function api(path, body) {
   const r = await fetch(path, body ? {
@@ -256,6 +268,11 @@ function drawSetup(st) {
       <label>④ EasyFlow 密碼</label>
       <input id="f_pass" type="password" placeholder="只會存在這台電腦" autocomplete="off">
     </div>
+    <div class="fld" id="browserFld" style="display:none">
+      <label>⑤ 用哪個瀏覽器</label>
+      <div class="seg" id="browserSeg"></div>
+      <div class="hint">填單和這個視窗都會用它。挑你平常在用的那個。</div>
+    </div>
     <div class="row"><button id="go">檢查並儲存</button></div>
     <div id="msg"></div>`;
   document.getElementById("footer").innerHTML = "";
@@ -265,6 +282,23 @@ function drawSetup(st) {
   if (cur.easyflowUser) document.getElementById("f_user").value = cur.easyflowUser;
 
   document.getElementById("openSetup").onclick = (e) => { e.preventDefault(); api("/open-setup-page", {}); };
+
+  // 只列這台真的裝了的。只有一個就不用問了，直接用。
+  fetch("/browsers").then((r) => r.json()).then(({ list }) => {
+    if (!list || list.length < 2) { pickedBrowser = list && list[0] ? list[0].channel : ""; return; }
+    pickedBrowser = cur.browser && list.some((x) => x.channel === cur.browser) ? cur.browser : list[0].channel;
+    const seg = document.getElementById("browserSeg");
+    seg.innerHTML = list.map((x) =>
+      `<button type="button" data-ch="${x.channel}">${esc(x.label)}</button>`).join("");
+    const paint = () => seg.querySelectorAll("button").forEach((b) => {
+      b.className = b.dataset.ch === pickedBrowser ? "on" : "";
+    });
+    seg.querySelectorAll("button").forEach((b) => {
+      b.onclick = () => { pickedBrowser = b.dataset.ch; paint(); };
+    });
+    paint();
+    document.getElementById("browserFld").style.display = "";
+  }).catch(() => { /* 抓不到就交給後端自動挑 */ });
   document.getElementById("go").onclick = submit;
   for (const id of ["f_email", "f_token", "f_user", "f_pass"]) {
     document.getElementById(id).addEventListener("keydown", (e) => { if (e.key === "Enter") submit(); });
@@ -277,6 +311,7 @@ async function submit() {
     token: document.getElementById("f_token").value.trim(),
     easyflowUser: document.getElementById("f_user").value.trim(),
     easyflowPass: document.getElementById("f_pass").value,
+    browser: pickedBrowser,
   };
   const msg = document.getElementById("msg");
   if (!body.email.includes("@")) { msg.innerHTML = '<div class="err">第 ① 個欄位看起來不像 email</div>'; return; }

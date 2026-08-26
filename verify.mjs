@@ -15,14 +15,23 @@ export async function checkToken({ appUrl, email, token }) {
   return d;
 }
 
-// 找一個能用的瀏覽器。回 "msedge" 或 "chrome"。
-export async function findBrowser() {
-  for (const ch of ["msedge", "chrome"]) {
-    try {
-      const b = await chromium.launch({ channel: ch, headless: false });
-      await b.close();
-      return ch;
-    } catch { /* 試下一個 */ }
+export const BROWSER_NAMES = { msedge: "Edge", chrome: "Chrome" };
+
+// 這個瀏覽器真的開得起來嗎（實際啟動一次再關掉，比檢查檔案存在可靠）
+export async function checkBrowser(channel) {
+  const b = await chromium.launch({ channel, headless: false });
+  await b.close();
+  return channel;
+}
+
+// 沒指定就自動挑一個能用的。回 "msedge" 或 "chrome"。
+export async function findBrowser(prefer) {
+  const order = prefer ? [prefer] : ["msedge", "chrome"];
+  for (const ch of order) {
+    try { return await checkBrowser(ch); } catch { /* 試下一個 */ }
+  }
+  if (prefer) {
+    throw new Error(`${BROWSER_NAMES[prefer] || prefer} 開不起來，可能沒安裝。換另一個試試。`);
   }
   throw new Error("找不到 Edge 或 Chrome。Windows 內建就有 Edge，請確認沒被移除。");
 }

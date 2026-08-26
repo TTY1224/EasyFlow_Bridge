@@ -52,6 +52,13 @@ function publicConfig(c) {
 }
 
 async function connect(cfg) {
+  // ⚠️ 重新設定完會再呼叫一次這裡。舊的連線一定要先收掉，否則同一個行程裡會有
+  // 兩個 channel 在聽同一條頻道 —— 每個請求被處理兩次，兩次登入互相搶，
+  // 結果兩邊都失敗（實際踩過：症狀是「登入 EasyFlow…」出現兩三次然後登入失敗）。
+  if (bridge) {
+    try { await bridge.stop(); } catch { /* ignore */ }
+    bridge = null;
+  }
   S.screen = "running";
   S.config = publicConfig(cfg);
   try {
@@ -71,7 +78,7 @@ async function connect(cfg) {
 async function runSetup(input) {
   const steps = [
     { name: "連上網站、確認授權碼", status: "wait" },
-    { name: "找瀏覽器", status: "wait" },
+    { name: BROWSERS[input.browser] ? "確認 " + BROWSERS[input.browser].label + " 能開" : "找瀏覽器", status: "wait" },
     { name: "試登入 EasyFlow", status: "wait" },
     { name: "存檔（密碼加密）", status: "wait" },
   ];
@@ -87,7 +94,7 @@ async function runSetup(input) {
     catch (e) { return fail(0, "網站不接受這組 email／授權碼：" + (e?.message || e)); }
 
     steps[1].status = "run";
-    try { cfg.browser = await findBrowser(); steps[1].status = "done"; }
+    try { cfg.browser = await findBrowser(BROWSERS[input.browser] ? input.browser : undefined); steps[1].status = "done"; }
     catch (e) { return fail(1, String(e?.message || e)); }
 
     steps[2].status = "run";
@@ -103,6 +110,31 @@ async function runSetup(input) {
   } catch (e) {
     S.setup.error = String(e?.message || e);
   }
+}
+
+// 瀏覽器安裝位置。這裡只用來「找得到就列出來給使用者選」——真的能不能開，
+// 設定流程會實際啟動一次來驗（比檢查檔案存在可靠）。
+const BROWSERS = {
+  msedge: {
+    label: "Edge",
+    paths: ["C:\\Program Files (x86)\\Microsoft\\Edge\\Application\\msedge.exe",
+            "C:\\Program Files\\Microsoft\\Edge\\Application\\msedge.exe"],
+  },
+  chrome: {
+    label: "Chrome",
+    paths: ["C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe",
+            "C:\\Program Files (x86)\\Google\\Chrome\\Application\\chrome.exe"],
+  },
+};
+
+function browserExe(channel) {
+  return (BROWSERS[channel]?.paths || []).find((x) => fs.existsSync(x)) || "";
+}
+
+function installedBrowsers() {
+  return Object.entries(BROWSERS)
+    .filter(([ch]) => browserExe(ch))
+    .map(([ch, v]) => ({ channel: ch, label: v.label }));
 }
 
 // ── 同一台電腦只跑一份 ──
@@ -159,6 +191,7 @@ const server = http.createServer(async (req, res) => {
   if (url === "/") return send(200, fs.readFileSync(path.join(HERE, "ui.html"), "utf8"), "text/html");
   if (url === "/logo") return send(200, logoDataUri, "text/plain");
   if (url === "/state") { lastPing = Date.now(); return send(200, JSON.stringify(S)); }
+  if (url === "/browsers") return send(200, JSON.stringify({ list: installedBrowsers() }));
   // 視窗被關掉時瀏覽器會用 sendBeacon 打這裡，這是最快、最準的收工訊號
   if (url === "/bye") { send(200, "{}"); return shutdown(); }
 
@@ -185,6 +218,10 @@ const server = http.createServer(async (req, res) => {
 
 // 只聽 127.0.0.1，別人連不進來。port 交給系統挑，避免撞到別的程式。
 // （EFBRIDGE_PORT 只是開發時要固定 port 好測試用，正常不會設。）
+// 讀一下偏好再開視窗，否則「已經在跑」那條路會用預設瀏覽器開，
+// 跟正在跑的那份用不同 profile，就會變成兩個視窗
+if (cfgStore.exists()) S.config = { ...S.config, ...cfgStore.peek() };
+
 const already = await findRunning();
 if (already) {
   // 已經有一份在跑：把它的視窗叫出來，自己安靜退場（不要印錯誤嚇人）
@@ -196,6 +233,10 @@ server.listen(Number(process.env.EFBRIDGE_PORT) || 0, "127.0.0.1", () => {
   if (already) return;
   const port = server.address().port;
   writeLock(port);
+
+  // 開視窗前先讀一下偏好（不解密，很快）：這樣視窗會用使用者選的瀏覽器開，
+  // 畫面上也能立刻顯示帳號，不用等連線完成。
+  if (cfgStore.exists()) S.config = { ...S.config, ...cfgStore.peek() };
 
   // ⚠️ 順序很重要：**先把視窗開起來**，再去連線。
   // 之前是先連線才開視窗，結果使用者點下去要等 10 秒以上才看到任何東西
@@ -218,7 +259,11 @@ server.listen(Number(process.env.EFBRIDGE_PORT) || 0, "127.0.0.1", () => {
 });
 
 function openWindow(port) {
-  const profile = path.join(os.tmpdir(), "efbridge-ui");
+  // 介面視窗用使用者選的那個瀏覽器（EasyFlow 操作也是同一個，行為一致）
+  const picked = S.config.browser === "chrome" ? "chrome" : "msedge";
+  // ⚠️ profile 目錄要分開放。Edge 和 Chrome 共用同一個 --user-data-dir 時，
+  // 先被其中一個佔住，另一個就啟動不起來（症狀：切換瀏覽器後視窗完全不出現）。
+  const profile = path.join(os.tmpdir(), "efbridge-ui-" + picked);
   const args = [
     `--app=http://127.0.0.1:${port}/`,
     `--user-data-dir=${profile}`,     // 專屬 profile：確保這是「我們的」行程，關窗抓得到
@@ -226,13 +271,7 @@ function openWindow(port) {
     "--no-first-run",
     "--no-default-browser-check",
   ];
-  const candidates = [
-    "C:\\Program Files (x86)\\Microsoft\\Edge\\Application\\msedge.exe",
-    "C:\\Program Files\\Microsoft\\Edge\\Application\\msedge.exe",
-    "C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe",
-    "C:\\Program Files (x86)\\Google\\Chrome\\Application\\chrome.exe",
-  ];
-  const exe = candidates.find((p) => fs.existsSync(p));
+  const exe = browserExe(picked) || browserExe(picked === "chrome" ? "msedge" : "chrome");
   if (!exe) {
     // 找不到就退而求其次用預設瀏覽器開（會有網址欄，但至少能用）
     spawn("cmd", ["/c", "start", "", `http://127.0.0.1:${port}/`], { detached: true, stdio: "ignore", windowsHide: true }).unref();
