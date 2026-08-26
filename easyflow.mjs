@@ -48,8 +48,38 @@ export const FORMS = {
     formId: "ESSF07",
     url: "../../../EPI/EPIE001/EPIE001.aspx?FormID=ESSF07",
     title: "請假申請(ESSF07)",
+    // 欄位 id（實際 dump 過）
+    f: {
+      person: "ESSQJ008",        // 請假人（_txt 工號、_btn_icon 放大鏡）
+      personName: "ESSQJ009",
+      dept: "ESSQJ015",
+      code: "ESSQJ036",          // 假別（只有這張單有）
+      startD: "ESSQJ021", startT: "ESSQJ022", endD: "ESSQJ023", endT: "ESSQJ024",
+      hours: "ESSQJ025", reason: "ESSQJ026", typeName: "ESSQJ020", days: "ESSQJ035",
+    },
+  },
+  overtime: {
+    label: "加班調休申請",
+    formId: "ESSF06",
+    url: "../../../EPI/EPIE001/EPIE001.aspx?FormID=ESSF06",
+    title: "加班調休申請(ESSF06)",
+    f: {
+      person: "ESSJBDX009",      // 調休人
+      personName: "ESSJBDX010",
+      dept: "ESSJBDX016",
+      code: "",                  // 沒有假別
+      startD: "ESSJBDX020", startT: "ESSJBDX021", endD: "ESSJBDX022", endT: "ESSJBDX023",
+      hours: "ESSJBDX004", reason: "ESSJBDX024", typeName: "", days: "",
+    },
   },
 };
+
+/* EasyFlow 外層工具列（在 frame<FormID> 這層，不是 framePlus）。
+ * ⚠️ 兩顆長得很像，絕對不要搞錯：
+ *    草稿儲存 = btnCreateToolSaveForm      ← 我們只按這顆
+ *    傳送     = btnPreCreateToolSendForm   ← 送去簽核，永遠不碰
+ */
+const BTN_DRAFT = "#MasterPage_btnCreateToolSaveForm";
 
 /* 三顆唯讀查詢按鈕。id 與跳出來的資料頁都是實際點過確認的。 */
 export const QUERIES = {
@@ -58,15 +88,26 @@ export const QUERIES = {
   punch: { label: "刷卡記錄", btn: "#btnCardRecord", page: "ESSF07_EmpRankRecord.aspx" },
 };
 
-/* 登入並開好指定的表單分頁。填單和查詢都從這裡開始。 */
-export async function openForm({ cfg, form = "leave", say = () => {}, browserChannel }) {
+/* 開瀏覽器並登入。回傳之後要重複用的東西（page、功能樹 frame）。
+ * 拆出來是為了批次代填：一次登入、開很多張單，不要每個人都重登一次。 */
+export async function login({ cfg, say = () => {}, browserChannel }) {
   const channel = browserChannel || cfg.browser || "msedge";
   const browser = await chromium.launch({ channel, headless: HEADLESS, slowMo: SLOW_MO });
   try {
     const ctx = await browser.newContext({ viewport: { width: 1500, height: 900 }, ignoreHTTPSErrors: true });
     const page = await ctx.newPage();
-    // EasyFlow 會跳好幾個 alert（例如「事後補假單請載明事由」），不接掉會卡住
-    page.on("dialog", async (d) => { say("[系統訊息] " + d.message().slice(0, 90)); await d.accept(); });
+    // EasyFlow 會跳好幾個 alert（「事後補假單請載明事由」、「表單頁籤已存在要不要重載」…），
+    // 不接掉會整個卡住。
+    // 順手把訊息留著：時數算不出來的時候，這裡通常就寫了真正的原因
+    // （例如「[韋冠羣可供調休時數不足]」），比我們自己猜準得多。
+    const notes = { last: "" };
+    page.on("dialog", async (d) => {
+      const m = d.message().trim();
+      say("[系統訊息] " + m.slice(0, 90));
+      // 這幾則是每次都會跳的例行提示，不是錯誤原因，不要記
+      if (!/頁籤已存在|事後補假單/.test(m)) notes.last = m.replace(/^\[|\]$/g, "");
+      await d.accept();
+    });
 
     say("登入 EasyFlow…");
     await page.goto(cfg.easyflowUrl, { waitUntil: "domcontentloaded", timeout: 45000 });
@@ -82,31 +123,223 @@ export async function openForm({ cfg, form = "leave", say = () => {}, browserCha
       throw new Error("登入失敗（帳號密碼錯誤，或公司系統異常）");
     }
 
-    // 只能透過系統自己的 createTab 開單。直接 goto 表單網址會被踢「Session過期」。
-    const f = FORMS[form] || FORMS.leave;
-    say(`開啟${f.label}單…`);
-
     const tree = page.frames().find((x) => x.name() === "contents1");
     if (!tree) throw new Error("找不到左邊的功能樹（contents1）");
-
-    // 先切到 ESS PLUS 模組（請假單在這個模組底下）。已經在這個模組時會沒反應，不算錯。
+    // 切到 ESS PLUS 模組（這些單都在這個模組底下）。已經選好時不會有反應，不算錯。
     try {
       await tree.selectOption("#ddlModule", ESS_MODULE);
       await page.waitForTimeout(4000);
     } catch { /* 沒有這個下拉、或已經選好了 */ }
 
-    // 用系統自己的導覽函式開單。不依賴個人快捷列，也不用展開資料夾。
-    await tree.evaluate(({ url, formId, title }) => {
-      if (typeof createTab !== "function") throw new Error("這個頁面沒有 createTab");
-      createTab(url, formId, title, "107");
-    }, { url: f.url, formId: f.formId, title: f.title });
-    await page.waitForTimeout(12000);
-
-    const fp = page.frames().find((x) => x.name() === "framePlus");
-    if (!fp) throw new Error(`${f.label}單沒有開起來`);
-    return { browser, page, fp };
+    return { browser, page, tree, notes };
   } catch (e) {
     try { await browser.close(); } catch { /* ignore */ }
+    throw e;
+  }
+}
+
+/* 開一張空白表單分頁。已經開過同一張時，系統會問「頁籤已存在要不要重載」，
+ * dialog handler 會自動接受 —— 所以重複呼叫會重用同一個分頁、內容清空，
+ * 分頁不會愈開愈多（實測過）。 */
+export async function openFormTab({ page, tree, form = "leave", say = () => {} }) {
+  const f = FORMS[form] || FORMS.leave;
+  say(`開啟${f.label}單…`);
+
+  // 只能透過系統自己的 createTab 開單。直接 goto 表單網址會被踢「Session過期」。
+  await tree.evaluate(({ url, formId, title }) => {
+    if (typeof createTab !== "function") throw new Error("這個頁面沒有 createTab");
+    createTab(url, formId, title, "107");
+  }, { url: f.url, formId: f.formId, title: f.title });
+  await page.waitForTimeout(13000);
+
+  // ⚠️ 一定要從外層 frame 往下找 framePlus。
+  // 同時開多張表單分頁時會有多個同名的 framePlus，用 page.frames() 找會抓到別張單。
+  const outer = page.frames().find((x) => x.name() === "frame" + f.formId);
+  if (!outer) throw new Error(`${f.label}單沒有開起來`);
+  const fp = outer.childFrames().find((x) => x.name() === "framePlus")
+    || outer.childFrames().flatMap((c) => c.childFrames()).find((x) => x.name() === "framePlus");
+  if (!fp) throw new Error(`${f.label}單的內容沒有載入`);
+  return { fp, outer, form: f };
+}
+
+/* 登入並開好指定的表單分頁（單張作業用）。 */
+export async function openForm({ cfg, form = "leave", say = () => {}, browserChannel }) {
+  const ses = await login({ cfg, say, browserChannel });
+  try {
+    const t = await openFormTab({ page: ses.page, tree: ses.tree, form, say });
+    return { browser: ses.browser, page: ses.page, tree: ses.tree, notes: ses.notes, ...t };
+  } catch (e) {
+    try { await ses.browser.close(); } catch { /* ignore */ }
+    throw e;
+  }
+}
+
+/* 在「請假人／調休人」的放大鏡視窗裡挑一個人（用姓名比對）。
+ *
+ * ⚠️ 不要去切「資料查詢條件」那個下拉（ddlSEARCH）。它是 AutoPostBack，
+ * 一切換就把打好的關鍵字清掉，查出來會是 0 筆（踩過）。
+ * 正確做法就是使用者手動時的做法：清空關鍵字 → 查詢 → 在結果裡找名字（會翻頁）。
+ */
+async function pickPerson({ page, fp, form, name, say = () => {} }) {
+  say(`選人：${name}…`);
+  await fp.click(`#${form.f.person}_btn_icon`, { force: true });
+  await page.waitForTimeout(6000);
+  const dlg = page.frames().find((f) => f.name() === "dialogIframe" || f.url().includes("F2Single"));
+  if (!dlg) throw new Error("選人視窗沒有開起來");
+
+  await dlg.fill("#txtSEARCH", "");
+  // 查詢鈕是隱藏的（Playwright 會拒絕點），用 DOM 直接觸發
+  await dlg.evaluate(() => document.getElementById("btnSEARCH").click());
+  await page.waitForTimeout(7000);
+
+  const readRows = () => dlg.evaluate(() => {
+    const t = Array.from(document.querySelectorAll("table")).sort((a, b) => b.rows.length - a.rows.length)[0];
+    if (!t) return [];
+    return Array.from(t.querySelectorAll("tr")).slice(1)
+      .map((tr) => Array.from(tr.querySelectorAll("td")).map((td) => (td.innerText || "").trim()))
+      .filter((c) => c.length > 2 && /^\d+$/.test(c[0] || ""))
+      .map((c) => ({ no: c[0], name: c[1], dep: c[4] || "" }));
+  });
+
+  const seen = [];
+  for (let pageNo = 1; pageNo <= 8; pageNo++) {
+    const rows = await readRows();
+    for (const r of rows) if (!seen.some((x) => x.no === r.no)) seen.push(r);
+    const hits = rows.filter((r) => r.name === name);
+    if (hits.length > 1) {
+      throw new Error(`名單裡有 ${hits.length} 個「${name}」（${hits.map((h) => h.no).join("、")}），沒辦法判斷是哪一位`);
+    }
+    if (hits.length === 1) {
+      await dlg.locator("tr").filter({ hasText: name }).first().dblclick({ force: true });
+      await page.waitForTimeout(5000);
+      const gotName = await fp.inputValue(`#${form.f.personName}_txt`).catch(() => "");
+      const gotNo = await fp.inputValue(`#${form.f.person}_txt`).catch(() => "");
+      if (gotName !== name) throw new Error(`選人沒生效（表單上目前是「${gotNo} ${gotName}」）`);
+      return { no: gotNo, name: gotName, dep: hits[0].dep };
+    }
+    const next = dlg.locator("a").filter({ hasText: String(pageNo + 1) }).last();
+    if (!(await next.count())) break;
+    await next.click({ force: true });
+    await page.waitForTimeout(5000);
+  }
+  throw new Error(`EasyFlow 的名單裡找不到「${name}」。名單上有：${seen.map((r) => r.name).join("、")}`);
+}
+
+/* 選假別（只有請假單有）。打字會被擋，只能用選擇器。 */
+async function pickLeaveType({ page, fp, form, code }) {
+  await fp.click(`#${form.f.code}_btn_icon`, { force: true });
+  await page.waitForTimeout(5000);
+  const dlg = page.frames().find((f) => f.name() === "dialogIframe" || f.url().includes("F2Single_Simple"));
+  if (!dlg) throw new Error("假別選擇器沒有開啟");
+
+  const findRow = () => dlg.$$eval("tr", (trs, c) => {
+    for (let i = 0; i < trs.length; i++) {
+      const cells = Array.from(trs[i].querySelectorAll("td")).map((td) => (td.innerText || "").trim());
+      if (cells.includes(c)) return i;
+    }
+    return -1;
+  }, code);
+
+  let idx = await findRow();
+  for (let p = 2; idx < 0 && p <= 3; p++) {        // 清單分 3 頁
+    const link = dlg.locator("a").filter({ hasText: String(p) }).last();
+    if (!(await link.count())) break;
+    await link.click({ force: true });
+    await page.waitForTimeout(3500);
+    idx = await findRow();
+  }
+  if (idx < 0) throw new Error(`清單中找不到假別代碼 ${code}`);
+  await dlg.locator("tr").nth(idx).click();
+  await page.waitForTimeout(4500);
+  const got = await fp.inputValue(`#${form.f.code}_txt`).catch(() => "");
+  if (got !== code) throw new Error(`假別沒有選中（目前是「${got}」）`);
+}
+
+/* 按「草稿儲存」。
+ * ⚠️ 只按草稿儲存，永遠不按旁邊那顆「傳送」（那個是送去簽核）。
+ * 為什麼要存草稿：表單是同一個分頁，不存的話沒辦法接著填下一個人。 */
+async function saveDraft({ page, outer, say = () => {} }) {
+  say("草稿儲存…");
+  await outer.click(BTN_DRAFT, { force: true });
+  await page.waitForTimeout(13000);
+}
+
+/* 批次代填：一次幫多位同事上同一種單。
+ * 每個人都是「重開一張空白表單 → 選人 → 填 → 計算 → 草稿儲存」。
+ * 一個人失敗不會中斷其他人，最後回報每個人的結果。 */
+export async function fillBatch({ cfg, req, say = () => {}, onEach = () => {} }) {
+  const form = FORMS[req.form];
+  if (!form) throw new Error(`未知的單別：${req.form}`);
+
+  const results = [];
+  // 只登入一次，之後每個人重開分頁就好（登入一次要 10 秒，7 個人就差 1 分鐘）
+  const ses = await login({ cfg, say });
+  const browser = ses.browser;
+  try {
+    for (let i = 0; i < req.people.length; i++) {
+      const name = req.people[i];
+      const tag = `(${i + 1}/${req.people.length}) ${name}`;
+      try {
+        if (ses.notes) ses.notes.last = "";      // 上一個人的訊息不要帶到這個人身上
+        // 每個人都重開一張空白單（重用同一個分頁，內容會清空）
+        const tab = await openFormTab({ page: ses.page, tree: ses.tree, form: req.form, say: () => {} });
+
+        const who = await pickPerson({ page: ses.page, fp: tab.fp, form, name, say: (t) => say(`${tag} ${t}`) });
+
+        if (form.f.code && req.code) {
+          say(`${tag} 選假別 ${req.code}…`);
+          await pickLeaveType({ page: ses.page, fp: tab.fp, form, code: req.code });
+        }
+
+        say(`${tag} 填日期時間與原因…`);
+        for (const [key, v] of [["startD", req.start], ["startT", req.startT],
+                                ["endD", req.end], ["endT", req.endT], ["reason", req.reason || ""]]) {
+          await tab.fp.fill(`#${form.f[key]}_txt`, v);
+        }
+
+        say(`${tag} 計算時數…`);
+        await tab.fp.click("#btnCount");
+        await ses.page.waitForTimeout(6000);
+        const hours = await tab.fp.inputValue(`#${form.f.hours}_txt`).catch(() => "");
+
+        // 算不出時數的單根本送不出去，不要存草稿。
+        // EasyFlow 通常會用 alert 講原因（可休時數不足、那天沒有上班時段…），有就照抄。
+        if (!hours || !(parseFloat(hours) > 0)) {
+          const why = ses.notes && ses.notes.last ? ses.notes.last : "";
+          throw new Error(why
+            ? `算不出時數：${why}`
+            : "算出來是 0 小時 —— 那個時段沒有可以計算的上班時間（假日、連假，或班表還沒產生）");
+        }
+
+        await saveDraft({ page: ses.page, outer: tab.outer, say: (t) => say(`${tag} ${t}`) });
+
+        const one = { name, no: who.no, dep: who.dep, hours, ok: true, error: "" };
+        results.push(one);
+        onEach(one);
+        say(`${tag} ✓ 已存草稿（${hours} 小時）`);
+      } catch (e) {
+        const one = { name, no: "", dep: "", hours: "", ok: false, error: String(e && e.message ? e.message : e).slice(0, 200) };
+        results.push(one);
+        onEach(one);
+        say(`${tag} ✗ ${one.error}`);
+
+        // EasyFlow 的 session 逾時了就不要硬跑下去 —— 後面每個人都會失敗，
+        // 而且錯誤訊息會很莫名。直接停下來，把已完成的回報出去，叫人重跑剩下的。
+        if (ses.notes && /Session過期|重新登入/.test(ses.notes.last || "")) {
+          const rest = req.people.slice(i + 1);
+          for (const n of rest) {
+            const skip = { name: n, no: "", dep: "", hours: "", ok: false, error: "EasyFlow 連線逾時，這位沒有處理到" };
+            results.push(skip);
+            onEach(skip);
+          }
+          say(`EasyFlow 連線逾時，剩下的 ${rest.length} 位沒跑。請再跑一次。`);
+          break;
+        }
+      }
+    }
+    return { browser, results };
+  } catch (e) {
+    if (browser) { try { await browser.close(); } catch { /* ignore */ } }
     throw e;
   }
 }
@@ -122,7 +355,8 @@ async function closeDialog(page, fp) {
 /* 填請假單，填完按「計算」就停手。
  * ⚠️ 這個函式永遠不會按存檔／暫存／送簽。送出與否一律由人決定。 */
 export async function fillLeave({ cfg, req, say = () => {} }) {
-  const { browser, page, fp } = await openForm({ cfg, form: "leave", say });
+  const ses = await openForm({ cfg, form: "leave", say });
+  const { browser, page, fp } = ses;
 
   // 假別只能用選擇器選，打字會被擋（系統會跳「假別還沒有選喔~」）
   say(`選假別 ${req.code}…`);
@@ -173,7 +407,10 @@ export async function fillLeave({ cfg, req, say = () => {} }) {
   // 而 2026/09/18 同樣流程就正常算出 8 小時。
   // 瀏覽器刻意留著不關，使用者可以直接改日期再按「計算」。
   if (!hours || !(parseFloat(hours) > 0)) {
-    const err = new Error("EasyFlow 算出來是 0 小時，那個時段沒有需要請假的上班時間 —— 可能是假日、國定假日/連假，或那天的班表還沒產生。表單留在畫面上，你可以直接改日期再按「計算」。");
+    const why = ses.notes && ses.notes.last ? ses.notes.last : "";
+    const err = new Error(why
+      ? `EasyFlow 算不出時數：${why}。表單留在畫面上，你可以直接改再按「計算」。`
+      : "EasyFlow 算出來是 0 小時，那個時段沒有需要請假的上班時間 —— 可能是假日、國定假日/連假，或那天的班表還沒產生。表單留在畫面上，你可以直接改日期再按「計算」。");
     err.keepBrowser = browser;    // 讓呼叫方知道視窗要留著
     err.shot = shot;
     throw err;

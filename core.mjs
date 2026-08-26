@@ -7,7 +7,7 @@
  */
 import { createClient } from "@supabase/supabase-js";
 import crypto from "node:crypto";
-import { fillLeave, runQuery, QUERIES } from "./easyflow.mjs";
+import { fillLeave, runQuery, fillBatch, QUERIES, FORMS } from "./easyflow.mjs";
 import { checkToken } from "./verify.mjs";
 
 export async function startBridge({ cfg, onLog = () => {}, onState = () => {} }) {
@@ -36,6 +36,14 @@ export async function startBridge({ cfg, onLog = () => {}, onState = () => {} })
     p && p.sig && p.requestId && QUERIES[p.kind] &&
     Math.abs(Date.now() - Number(p.ts || 0)) <= 180000 &&
     safeEq(hmac([p.requestId, p.ts, p.email, "q", p.kind].join("|")), p.sig);
+
+  // 批次的簽章夾一個 "b" 當領域標記，人名也一起簽 ——
+  // 所以拿到一張批次簽章也沒辦法改成幫別人上單。
+  const verifyBatch = (p) =>
+    p && p.sig && p.requestId && FORMS[p.form] && Array.isArray(p.people) && p.people.length &&
+    Math.abs(Date.now() - Number(p.ts || 0)) <= 180000 &&
+    safeEq(hmac([p.requestId, p.ts, p.email, "b", p.form, p.people.join(","),
+                 p.code, p.start, p.startT, p.end, p.endT, p.reason].join("|")), p.sig);
 
   const supa = createClient(conn.supabaseUrl, conn.supabaseKey, { realtime: { params: { eventsPerSecond: 20 } } });
   const channel = supa.channel(conn.channel, { config: { broadcast: { self: false }, presence: { key: "bridge" } } });
@@ -109,7 +117,53 @@ export async function startBridge({ cfg, onLog = () => {}, onState = () => {} })
     }
   }
 
+  /* 批次代填：一次幫多位同事上同一種單。
+     每個人都是「重開空白單 → 選人 → 填 → 計算 → 草稿儲存」，
+     ⚠️ 只按草稿儲存，永遠不按傳送。 */
+  async function handleBatch(req) {
+    busy = true;
+    const label = FORMS[req.form].label;
+    onState({ busy: true, task: `批次${label}` });
+    const rid = String(req.requestId);
+    const say = (text) => { log("　" + text); emit("status", { requestId: rid, text }); };
+    let done = false;
+    const finish = (ok, error) => {
+      if (done) return;
+      done = true; busy = false;
+      onState({ busy: false, task: "" });
+      emit("done", { requestId: rid, ok, error: error || "" });
+      if (!ok) log("批次失敗：" + error, "err");
+    };
+
+    try {
+      log(`收到批次請求：${label} × ${req.people.length} 人（${req.people.join("、")}）`, "task");
+      // 有一張填好還沒送出的單開著時不能跑批次：同一個帳號再登入會把那張單踢掉
+      if (openBrowser) {
+        throw new Error("你有一張填好還沒送出的單開著。先處理完再跑批次（同時登入兩次會把那張單踢掉）");
+      }
+
+      const r = await fillBatch({
+        cfg, req, say,
+        // 每填完一個人就即時回報，讓聊天室看得到進度
+        onEach: (one) => emit("batchone", { requestId: rid, ...one }),
+      });
+      openBrowser = r.browser;      // 瀏覽器留著，讓使用者自己檢查草稿
+
+      const okCount = r.results.filter((x) => x.ok).length;
+      emit("batchdone", { requestId: rid, form: req.form, label, results: r.results });
+      log(`批次完成：${okCount}/${r.results.length} 成功，都存成草稿`, okCount ? "ok" : "err");
+      finish(true, "");
+    } catch (e) {
+      finish(false, String(e && e.message ? e.message : e).slice(0, 250));
+    }
+  }
+
   channel
+    .on("broadcast", { event: "b" }, ({ payload }) => {
+      if (!verifyBatch(payload)) { log("收到簽章無效的批次請求，已忽略", "warn"); return; }
+      if (busy) { emit("done", { requestId: payload.requestId, ok: false, error: "正在處理上一個請求，請稍候" }); return; }
+      handleBatch(payload);
+    })
     .on("broadcast", { event: "req" }, ({ payload }) => {
       if (!verifyFill(payload)) { log("收到簽章無效的填單請求，已忽略", "warn"); return; }
       if (busy) { emit("done", { requestId: payload.requestId, ok: false, error: "正在處理上一個請求，請稍候" }); return; }
