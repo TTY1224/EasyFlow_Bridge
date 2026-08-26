@@ -18,11 +18,37 @@ const HEADLESS = false;
  * 掛好時就被點到，症狀是「按鈕找不到」或「假別沒選中」。 */
 const SLOW_MO = 250;
 
-/* 表單分頁：banner 上那排按鈕。目前只用到請假申請。
- * 其餘幾個（點名結果／加班調休／補刷卡／不加班原因說明）是同一排的按鈕，
- * id 應該是 tdMenu_2…5，但**還沒實際點過驗證**，要加新單種時請先確認。 */
+/* 表單清單。
+ *
+ * ⚠️ 不要用 banner 上那排快捷按鈕（#tdMenu_1…）—— **那排是每個人自己排的**，
+ * 同事的「請假申請」不一定在上面。要走左邊功能樹的正規路徑。
+ *
+ * 左邊那棵樹（frame「contents1」）上每個表單都是這種連結：
+ *   javascript:createTab('../../../EPI/EPIE001/EPIE001.aspx?FormID=ESSF07',
+ *                        'ESSF07','請假申請(ESSF07)','107')
+ * createTab 是系統自己的導覽函式，直接呼叫就會開單（實測可行）。
+ * 這樣既不依賴個人的快捷列，也不用去展開資料夾。
+ *
+ * 從樹上實際抓到的表單代號（要加新單種時照抄就好，不用再猜）：
+ *   ESSF07  請假申請          ESSF03  補刷卡申請
+ *   ESSF06  加班調休申請      ESSF93  不加班原因說明
+ *   ESSF50  班次變更          ESSF51  加班計劃申請(多時段多人)
+ *   ESSF52C1 班次互換         ESSF17G 銷假申請
+ *   ESSF21G 國內、外出差申請單 ESSF01  排班申請
+ *   ESSQ07  點名結果（查詢類，路徑是 EPII003 不是 EPIE001）
+ *   ESSQ08  請假資料（同上）
+ * 表單類走 EPI/EPIE001/EPIE001.aspx，查詢類走 EPI/EPII003/EPII003.aspx。
+ * 但**欄位 id 每張單都不一樣**，加新單種還是要自己 dump 一次。
+ */
+const ESS_MODULE = "AppFormESS";      // 左欄下拉選單「ESS PLUS模組」的 value
+
 export const FORMS = {
-  leave: { menu: "#tdMenu_1", label: "請假申請" },
+  leave: {
+    label: "請假申請",
+    formId: "ESSF07",
+    url: "../../../EPI/EPIE001/EPIE001.aspx?FormID=ESSF07",
+    title: "請假申請(ESSF07)",
+  },
 };
 
 /* 三顆唯讀查詢按鈕。id 與跳出來的資料頁都是實際點過確認的。 */
@@ -59,8 +85,23 @@ export async function openForm({ cfg, form = "leave", say = () => {}, browserCha
     // 只能透過系統自己的 createTab 開單。直接 goto 表單網址會被踢「Session過期」。
     const f = FORMS[form] || FORMS.leave;
     say(`開啟${f.label}單…`);
-    await page.frames().find((x) => x.name() === "banner").click(f.menu);
+
+    const tree = page.frames().find((x) => x.name() === "contents1");
+    if (!tree) throw new Error("找不到左邊的功能樹（contents1）");
+
+    // 先切到 ESS PLUS 模組（請假單在這個模組底下）。已經在這個模組時會沒反應，不算錯。
+    try {
+      await tree.selectOption("#ddlModule", ESS_MODULE);
+      await page.waitForTimeout(4000);
+    } catch { /* 沒有這個下拉、或已經選好了 */ }
+
+    // 用系統自己的導覽函式開單。不依賴個人快捷列，也不用展開資料夾。
+    await tree.evaluate(({ url, formId, title }) => {
+      if (typeof createTab !== "function") throw new Error("這個頁面沒有 createTab");
+      createTab(url, formId, title, "107");
+    }, { url: f.url, formId: f.formId, title: f.title });
     await page.waitForTimeout(12000);
+
     const fp = page.frames().find((x) => x.name() === "framePlus");
     if (!fp) throw new Error(`${f.label}單沒有開起來`);
     return { browser, page, fp };
