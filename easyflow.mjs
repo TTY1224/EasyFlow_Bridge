@@ -291,9 +291,13 @@ export async function fillBatch({ cfg, req, say = () => {}, onEach = () => {} })
           await pickLeaveType({ page: ses.page, fp: tab.fp, form, code: req.code });
         }
 
-        say(`${tag} 填日期時間與原因…`);
+        say(`${tag} 填日期與原因…`);
+        // ⚠️ 時間沒指定就不要碰那兩個欄位。
+        // EasyFlow 會照「那個人的班別」自動帶上班時間 —— 選手是 12:00~22:00、
+        // 一般同事是 09:00~18:00。我們自己硬填 09:00~18:00 會把選手的單填錯。
         for (const [key, v] of [["startD", req.start], ["startT", req.startT],
                                 ["endD", req.end], ["endT", req.endT], ["reason", req.reason || ""]]) {
+          if (key === "startT" || key === "endT") { if (!v) continue; }
           await tab.fp.fill(`#${form.f[key]}_txt`, v);
         }
 
@@ -301,6 +305,9 @@ export async function fillBatch({ cfg, req, say = () => {}, onEach = () => {} })
         await tab.fp.click("#btnCount");
         await ses.page.waitForTimeout(6000);
         const hours = await tab.fp.inputValue(`#${form.f.hours}_txt`).catch(() => "");
+        // 回報實際用了什麼時間（沒指定的話就是系統照班別帶的），使用者才知道填了什麼
+        const usedST = await tab.fp.inputValue(`#${form.f.startT}_txt`).catch(() => "");
+        const usedET = await tab.fp.inputValue(`#${form.f.endT}_txt`).catch(() => "");
 
         // 算不出時數的單根本送不出去，不要存草稿。
         // EasyFlow 通常會用 alert 講原因（可休時數不足、那天沒有上班時段…），有就照抄。
@@ -313,12 +320,12 @@ export async function fillBatch({ cfg, req, say = () => {}, onEach = () => {} })
 
         await saveDraft({ page: ses.page, outer: tab.outer, say: (t) => say(`${tag} ${t}`) });
 
-        const one = { name, no: who.no, dep: who.dep, hours, ok: true, error: "" };
+        const one = { name, no: who.no, dep: who.dep, hours, startT: usedST, endT: usedET, ok: true, error: "" };
         results.push(one);
         onEach(one);
-        say(`${tag} ✓ 已存草稿（${hours} 小時）`);
+        say(`${tag} ✓ 已存草稿（${usedST}~${usedET}，${hours} 小時）`);
       } catch (e) {
-        const one = { name, no: "", dep: "", hours: "", ok: false, error: String(e && e.message ? e.message : e).slice(0, 200) };
+        const one = { name, no: "", dep: "", hours: "", startT: "", endT: "", ok: false, error: String(e && e.message ? e.message : e).slice(0, 200) };
         results.push(one);
         onEach(one);
         say(`${tag} ✗ ${one.error}`);
@@ -387,10 +394,13 @@ export async function fillLeave({ cfg, req, say = () => {} }) {
   const gotCode = await fp.inputValue("#ESSQJ036_txt").catch(() => "");
   if (gotCode !== req.code) throw new Error(`假別沒有選中（目前是「${gotCode}」）`);
 
-  say("填日期、時間與原因…");
+  say("填日期與原因…");
+  // ⚠️ 時間沒指定就不要碰。EasyFlow 會照那個人的班別帶（選手 12:00~22:00、
+  // 一般同事 09:00~18:00），硬填會填錯。
   for (const [id, v] of [["ESSQJ021_txt", req.start], ["ESSQJ022_txt", req.startT],
                          ["ESSQJ023_txt", req.end], ["ESSQJ024_txt", req.endT],
                          ["ESSQJ026_txt", req.reason || ""]]) {
+    if ((id === "ESSQJ022_txt" || id === "ESSQJ024_txt") && !v) continue;
     await fp.fill("#" + id, v);
   }
 
