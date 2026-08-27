@@ -66,6 +66,7 @@ export const FORMS = {
   leave: {
     label: "請假申請",
     formId: "ESSF07",
+    idPrefix: "ESSQJ",          // 這張單所有欄位 id 的開頭（截圖時用來框出表單範圍）
     url: "../../../EPI/EPIE001/EPIE001.aspx?FormID=ESSF07",
     title: "請假申請(ESSF07)",
     // 欄位 id（實際 dump 過）
@@ -81,6 +82,7 @@ export const FORMS = {
   overtime: {
     label: "加班調休申請",
     formId: "ESSF06",
+    idPrefix: "ESSJBDX",
     url: "../../../EPI/EPIE001/EPIE001.aspx?FormID=ESSF06",
     title: "加班調休申請(ESSF06)",
     f: {
@@ -150,25 +152,59 @@ export async function login({ cfg, say = () => {}, browserChannel }) {
 
     say("登入 EasyFlow…");
     await page.goto(cfg.easyflowUrl, { waitUntil: "domcontentloaded", timeout: 45000 });
-    await page.waitForTimeout(2000);
-    const lf = page.frames().find((f) => f.url().includes("EFDBLogin")) || page.mainFrame();
+    // 等登入欄位長出來就好（原本固定等 2 秒，實測通常 0.5 秒內）
+    const lf = await until(async () => {
+      const f = page.frames().find((x) => x.url().includes("EFDBLogin")) || page.mainFrame();
+      return (await f.locator("#txtName").count()) ? f : null;
+    }, { timeout: 30000, page });
+    if (!lf) throw new Error("登入頁沒有出現（公司系統連不上，或網址設錯了）");
     await lf.fill("#txtName", cfg.easyflowUser);
     // 密碼直接填進欄位就好：頁面自己會用 RSA 加密後才送出（hdPublicKeyExponent/hdEncrypted）。
     // 也正是因為這樣，才沒辦法在伺服器端單純 POST 登入。
     await lf.fill("#txtPassword", cfg.easyflowPass);
     await lf.click("#imgBtnLogin");
-    await page.waitForTimeout(7000);
-    if (!page.frames().find((f) => f.name() === "banner")) {
-      throw new Error("登入失敗（帳號密碼錯誤，或公司系統異常）");
+
+    /* 原本固定等 7 秒 + 4 秒。改成等真正的完成訊號，但**不能只等 frame 出現** ——
+     * ⚠️ 實測：contents1 這個 frame 會先出現，約 3.4 秒後才換成真正的內容。
+     * 在那之前呼叫 createTab，等於打在馬上要被丟掉的舊文件上，單子完全開不起來
+     * （症狀：「請假申請單沒有開起來」）。踩過，所以這裡要確認樹真的載完。
+     * 另外實測：切模組那個下拉**不會 postback**（樹本來就含所有表單連結），
+     * 所以切完幾乎立刻就能用，原本那 4 秒也是白等。 */
+    const treeReady = (needModule) => until(async () => {
+      const f = page.frames().find((x) => x.name() === "contents1");
+      if (!f || f.isDetached()) return null;
+      const ok = await f.evaluate((m) => {
+        if (document.readyState !== "complete") return null;
+        const el = document.getElementById("ddlModule");
+        if (!el) return null;                                  // 樹還沒長好
+        if (m && el.value !== m) return null;                  // 模組還沒切過去
+        // eslint-disable-next-line no-undef
+        return (!m || typeof createTab === "function") ? true : null;
+      }, needModule ? ESS_MODULE : "");
+      return ok ? f : null;
+    }, { timeout: 45000, step: 300, page });
+
+    let tree = await treeReady(false);
+    if (!tree) {
+      if (!page.frames().find((f) => f.name() === "banner")) {
+        throw new Error("登入失敗（帳號密碼錯誤，或公司系統異常）");
+      }
+      throw new Error("左邊的功能樹（contents1）一直沒有載完");
     }
 
-    const tree = page.frames().find((x) => x.name() === "contents1");
-    if (!tree) throw new Error("找不到左邊的功能樹（contents1）");
+    /* ⚠️ 樹載完了還不夠。右邊「放表單分頁」的那幾個 frame（framedefault / framehome）
+     * 要再晚 1~2 秒才出現，在那之前呼叫 createTab **不會報錯、但什麼都不會開**。
+     * 實測過：回傳一切正常，然後等 20 秒也等不到 frameESSF07。
+     * 這是把登入的死等改成輪詢時踩到的坑 —— 沒有這一步，開單一定失敗。 */
+    await until(async () => {
+      const f = page.frames().find((x) => /^frame(default|home)$/.test(x.name() || ""));
+      if (!f || f.isDetached()) return null;
+      return await f.evaluate(() => (document.readyState === "complete" ? true : null));
+    }, { timeout: 30000, step: 250, page });
+
     // 切到 ESS PLUS 模組（這些單都在這個模組底下）。已經選好時不會有反應，不算錯。
-    try {
-      await tree.selectOption("#ddlModule", ESS_MODULE);
-      await page.waitForTimeout(4000);
-    } catch { /* 沒有這個下拉、或已經選好了 */ }
+    try { await tree.selectOption("#ddlModule", ESS_MODULE); } catch { /* 沒有這個下拉、或已經選好了 */ }
+    tree = (await treeReady(true)) || tree;
 
     return { browser, page, tree, notes };
   } catch (e) {
@@ -198,23 +234,42 @@ export async function openFormTab({ page, tree, form = "leave", say = () => {}, 
   const beforeFp = prevFp || (pick() ? pick().fp : null);
 
   // 只能透過系統自己的 createTab 開單。直接 goto 表單網址會被踢「Session過期」。
-  await tree.evaluate(({ url, formId, title }) => {
+  const fire = () => tree.evaluate(({ url, formId, title }) => {
+    // eslint-disable-next-line no-undef
     if (typeof createTab !== "function") throw new Error("這個頁面沒有 createTab");
+    // eslint-disable-next-line no-undef
     createTab(url, formId, title, "107");
   }, { url: f.url, formId: f.formId, title: f.title });
+  await fire();
 
-  // ⚠️ 這 3 秒不能省：系統會先問「頁籤已存在要不要重載」（dialog handler 自動接受），
-  // 重載才開始。太早去抓 frame 會抓到「還沒被換掉的舊表單」，
+  // ⚠️ 開過同一張單時這 3 秒不能省：系統會先問「頁籤已存在要不要重載」
+  // （dialog handler 自動接受），重載才開始。太早去抓 frame 會抓到「還沒被換掉的舊表單」，
   // 之後點放大鏡完全沒反應（症狀：「選人視窗沒有開起來」）。踩過。
-  await page.waitForTimeout(3000);
+  // 但**第一次開**（beforeFp 是 null）根本不會有那個對話框，那 3 秒是純白等。
+  await page.waitForTimeout(beforeFp ? 3000 : 600);
 
   // 等到「重載後的新 framePlus，而且是一張空白單」。
   // 條件連續成立兩次才算 —— 載入中途讀得到值但馬上又被換掉。
   let lastFp = null;
   let stable = 0;
+  let tries = 1;
+  let firedAt = Date.now();
   const got = await until(async () => {
     const t = pick();
-    if (!t || t.fp.isDetached()) { stable = 0; return null; }
+    if (!t || t.fp.isDetached()) {
+      stable = 0;
+      /* ⚠️ createTab 偶爾「呼叫成功但什麼都沒開」，而且不會拋錯。
+       * 實測過：右邊放表單分頁的那些 frame 還沒準備好時就會這樣，
+       * 呼叫回傳一切正常，然後等 20 秒也等不到 frameESSF07。
+       * 用哪個訊號判斷「準備好了」都不夠可靠，所以乾脆再叫一次 ——
+       * 反正真的開起來了就不會走到這裡。 */
+      if (tries < 4 && Date.now() - firedAt > 6000) {
+        tries += 1; firedAt = Date.now();
+        say(`${f.label}單沒反應，再開一次…`);
+        await fire().catch(() => { /* 樹壞了的話下面會逾時報錯 */ });
+      }
+      return null;
+    }
     if (beforeFp && t.fp === beforeFp) { stable = 0; return null; }   // 還是舊的，reload 還沒完成
     const person = await t.fp.inputValue(`#${f.f.person}_txt`);
     if (!person) { stable = 0; return null; }
@@ -225,7 +280,7 @@ export async function openFormTab({ page, tree, form = "leave", say = () => {}, 
   }, { timeout: 45000, step: 400, page });
 
   if (!got) {
-    if (!pick()) throw new Error(`${f.label}單沒有開起來`);
+    if (!pick()) throw new Error(`${f.label}單沒有開起來（試了 ${tries} 次）`);
     throw new Error(`${f.label}單一直沒有變成空白表單`);
   }
   return { fp: got.fp, outer: got.outer, form: f };
@@ -360,9 +415,16 @@ async function closePicker(page, fp) {
 /* 選假別（只有請假單有）。打字會被擋，只能用選擇器。 */
 async function pickLeaveType({ page, fp, form, code }) {
   await fp.click(`#${form.f.code}_btn_icon`, { force: true });
-  await page.waitForTimeout(5000);
-  const dlg = page.frames().find((f) => f.name() === "dialogIframe" || f.url().includes("F2Single_Simple"));
+  // 等視窗真的有清單（原本固定等 5 秒，實測 1 秒內就好）
+  const dlg = await until(async () => {
+    const d = page.frames().find((f) => f.name() === "dialogIframe" || f.url().includes("F2Single_Simple"));
+    if (!d || d.isDetached()) return null;
+    return (await d.locator("tr").count()) > 2 ? d : null;
+  }, { timeout: 25000, page });
   if (!dlg) throw new Error("假別選擇器沒有開啟");
+
+  // 翻頁沒有明確的完成訊號，只能看「清單內容有沒有換掉」
+  const peek = () => dlg.evaluate(() => document.body.innerText.slice(0, 400)).catch(() => "");
 
   const findRow = () => dlg.$$eval("tr", (trs, c) => {
     for (let i = 0; i < trs.length; i++) {
@@ -376,15 +438,21 @@ async function pickLeaveType({ page, fp, form, code }) {
   for (let p = 2; idx < 0 && p <= 3; p++) {        // 清單分 3 頁
     const link = dlg.locator("a").filter({ hasText: String(p) }).last();
     if (!(await link.count())) break;
+    const was = await peek();
     await link.click({ force: true });
-    await page.waitForTimeout(3500);
+    await until(async () => (await peek()) !== was, { timeout: 9000, step: 250, page });
     idx = await findRow();
   }
   if (idx < 0) throw new Error(`清單中找不到假別代碼 ${code}`);
   await dlg.locator("tr").nth(idx).click();
-  await page.waitForTimeout(4500);
-  const got = await fp.inputValue(`#${form.f.code}_txt`).catch(() => "");
-  if (got !== code) throw new Error(`假別沒有選中（目前是「${got}」）`);
+  // 選完會 postback 把假別帶回表單。等欄位真的變成那個代碼（原本固定等 4.5 秒，實測約 1 秒）。
+  // 中途 fp 可能正在重載、讀欄位會炸 —— until 會把例外當成「還沒好」。
+  const got = await until(async () => (await fp.inputValue(`#${form.f.code}_txt`)) === code,
+                          { timeout: 25000, step: 250, page });
+  if (!got) {
+    const now = await fp.inputValue(`#${form.f.code}_txt`).catch(() => "");
+    throw new Error(`假別沒有選中（目前是「${now}」）`);
+  }
 }
 
 /* 按「草稿儲存」。
@@ -425,17 +493,29 @@ export async function sendForm({ page, outer, notes, say = () => {} }) {
 /* 打開草稿資料匣，回傳目前所有草稿（用「填表日期時間」當識別）。 */
 export async function listDrafts({ page, tree, say = () => {} }) {
   say("打開草稿資料匣…");
-  await tree.evaluate((b) => {
+  const fire = () => tree.evaluate((b) => {
     // eslint-disable-next-line no-undef
     createTab(b.url, b.id, b.title, b.w);
   }, DRAFT_BOX);
-  await page.waitForTimeout(3000);
+  await fire();
+  await page.waitForTimeout(1200);
 
-  const box = await until(() => {
+  // ⚠️ 跟開表單一樣：createTab 偶爾呼叫成功但什麼都沒開，不會報錯。
+  // 這裡沒開起來的後果是「跑前的草稿清單」變成空的 → 最後數量對不上 → 整批不給送。
+  // 實測踩過，所以一樣要會重試。
+  let tries = 1;
+  let firedAt = Date.now();
+  const box = await until(async () => {
     const f = page.frames().find((x) => x.name() === "frameLoadBox" || x.url().includes("LoadBox.aspx"));
-    return f && !f.isDetached() ? f : null;
+    if (f && !f.isDetached()) return f;
+    if (tries < 4 && Date.now() - firedAt > 5000) {
+      tries += 1; firedAt = Date.now();
+      say("草稿資料匣沒反應，再開一次…");
+      await fire().catch(() => { /* 下面會逾時報錯 */ });
+    }
+    return null;
   }, { timeout: 30000, page });
-  if (!box) throw new Error("草稿資料匣沒有開起來");
+  if (!box) throw new Error(`草稿資料匣沒有開起來（試了 ${tries} 次）`);
 
   const rows = await until(async () => {
     const r = await box.evaluate(() => {
@@ -508,6 +588,11 @@ export async function fillBatch({ cfg, req, say = () => {}, onEach = () => {} })
   if (!form) throw new Error(`未知的單別：${req.form}`);
 
   const results = [];
+  // 每個人的截圖先收在這裡，**全部跑完才一起傳回去**。
+  // 為什麼不邊跑邊傳：使用者要的是最後一次看完全部，一張一張跳出來只會洗版；
+  // 而且 Realtime 一則訊息有大小上限（約 256KB），人數不固定（7、8、9 位都可能），
+  // 全部塞進同一則一定會爆 —— 所以是「最後才傳，但一個人一則」。
+  const shots = [];
   let lastFp = null;      // 上一位用的 framePlus，用來確認下一位拿到的是新的
   // 只登入一次，之後每個人重開分頁就好（登入一次要 10 秒，7 個人就差 1 分鐘）
   const ses = await login({ cfg, say });
@@ -577,6 +662,10 @@ export async function fillBatch({ cfg, req, say = () => {}, onEach = () => {} })
             : "算出來是 0 小時 —— 那個時段沒有可以計算的上班時間（假日、連假，或班表還沒產生）");
         }
 
+        // 趁表單還填著的時候截圖（存完草稿畫面會被收掉）。截不到就是空字串，不影響上單。
+        const shot = await snapForm(ses.page, tab.fp, form);
+        if (shot) shots.push({ name, no: who.no, shot });
+
         await saveDraft({ page: ses.page, outer: tab.outer, notes: ses.notes, say: (t) => say(`${tag} ${t}`) });
 
         const one = { name, no: who.no, dep: who.dep, hours, startT: usedST, endT: usedET, ok: true, error: "", draft: "" };
@@ -633,7 +722,7 @@ export async function fillBatch({ cfg, req, say = () => {}, onEach = () => {} })
       }
     } catch { /* 拿不到就沒有 draft 欄位，UI 會自動不顯示送出 */ }
 
-    return { browser, results };
+    return { browser, results, shots };
   } catch (e) {
     if (browser) { try { await browser.close(); } catch { /* ignore */ } }
     throw e;
@@ -653,53 +742,34 @@ async function closeDialog(page, fp) {
 export async function fillLeave({ cfg, req, say = () => {} }) {
   const ses = await openForm({ cfg, form: "leave", say });
   const { browser, page, fp } = ses;
+  const form = FORMS.leave;
 
   // 假別只能用選擇器選，打字會被擋（系統會跳「假別還沒有選喔~」）
   say(`選假別 ${req.code}…`);
-  await fp.click("#ESSQJ036_btn_icon", { force: true });
-  await page.waitForTimeout(5000);
-  const dlg = page.frames().find((f) => f.name() === "dialogIframe" || f.url().includes("F2Single_Simple"));
-  if (!dlg) throw new Error("假別選擇器沒有開啟");
-
-  const findRow = () => dlg.$$eval("tr", (trs, c) => {
-    for (let i = 0; i < trs.length; i++) {
-      const cells = Array.from(trs[i].querySelectorAll("td")).map((td) => (td.innerText || "").trim());
-      if (cells.includes(c)) return i;
-    }
-    return -1;
-  }, req.code);
-
-  let idx = await findRow();
-  for (let p = 2; idx < 0 && p <= 3; p++) {        // 清單分 3 頁；查詢鈕是隱藏的，只能翻頁
-    const link = dlg.locator("a").filter({ hasText: String(p) }).last();
-    if (!(await link.count())) break;
-    await link.click({ force: true });
-    await page.waitForTimeout(3500);
-    idx = await findRow();
-  }
-  if (idx < 0) throw new Error(`清單中找不到假別代碼 ${req.code}`);
-  await dlg.locator("tr").nth(idx).click();
-  await page.waitForTimeout(4500);
-  const gotCode = await fp.inputValue("#ESSQJ036_txt").catch(() => "");
-  if (gotCode !== req.code) throw new Error(`假別沒有選中（目前是「${gotCode}」）`);
+  await pickLeaveType({ page, fp, form, code: req.code });
 
   say("填日期與原因…");
   // ⚠️ 時間沒指定就不要碰。EasyFlow 會照那個人的班別帶（選手 12:00~22:00、
   // 一般同事 09:00~18:00），硬填會填錯。
-  for (const [id, v] of [["ESSQJ021_txt", req.start], ["ESSQJ022_txt", req.startT],
-                         ["ESSQJ023_txt", req.end], ["ESSQJ024_txt", req.endT],
-                         ["ESSQJ026_txt", req.reason || ""]]) {
-    if ((id === "ESSQJ022_txt" || id === "ESSQJ024_txt") && !v) continue;
-    await fp.fill("#" + id, v);
+  for (const [key, v] of [["startD", req.start], ["startT", req.startT],
+                          ["endD", req.end], ["endT", req.endT], ["reason", req.reason || ""]]) {
+    if ((key === "startT" || key === "endT") && !v) continue;
+    await fp.fill(`#${form.f[key]}_txt`, v);
   }
 
   say("計算時數…");
+  if (ses.notes) ses.notes.last = "";
   await fp.click("#btnCount");
-  await page.waitForTimeout(5000);
-  const hours = await fp.inputValue("#ESSQJ025_txt").catch(() => "");
-  const days = await fp.inputValue("#ESSQJ035_txt").catch(() => "");
-  const typeName = await fp.inputValue("#ESSQJ020_txt").catch(() => "");
-  const shot = await snapForm(page, fp);
+  // 等時數算出來，或系統跳訊息說算不出來（原本固定等 5 秒）。
+  // 上限壓短：算得出來通常 1~3 秒；算不出來時系統不一定會講話，欄位就一直空著。
+  await until(async () => {
+    const h = await fp.inputValue(`#${form.f.hours}_txt`);
+    return (h && parseFloat(h) > 0) || (ses.notes && ses.notes.last);
+  }, { timeout: 12000, page });
+  const hours = await fp.inputValue(`#${form.f.hours}_txt`).catch(() => "");
+  const days = await fp.inputValue(`#${form.f.days}_txt`).catch(() => "");
+  const typeName = await fp.inputValue(`#${form.f.typeName}_txt`).catch(() => "");
+  const shot = await snapForm(page, fp, form);
 
   // 時數算不出來就不能說「填好了」。實測：連假的日期（例如 2026/09/25、09/28）
   // 會跳「[輸入時段內不存在需要請假的時間區間]」且時數留空，這種單根本送不出去；
@@ -730,8 +800,12 @@ export async function runQuery({ cfg, kind, say = () => {} }) {
   try {
     say(`讀取「${meta.label}」…`);
     await fp.click(meta.btn, { force: true });
-    await page.waitForTimeout(9000);
-    const dlg = page.frames().find((f) => f.url().includes(meta.page));
+    // 等結果表格真的長出來（原本固定等 9 秒）
+    const dlg = await until(async () => {
+      const d = page.frames().find((f) => f.url().includes(meta.page));
+      if (!d || d.isDetached()) return null;
+      return (await d.locator("tr").count()) > 1 ? d : null;
+    }, { timeout: 30000, page });
     if (!dlg) throw new Error(`「${meta.label}」沒有開起來`);
 
     const table = await dlg.evaluate(() => {
@@ -755,7 +829,7 @@ export async function runQuery({ cfg, kind, say = () => {} }) {
 /* 把填好的表單截一張圖，讓使用者在聊天室裡就能核對，不用切視窗。
  * 走 Realtime 傳，不上傳雲端：單子上有姓名/員編/部門，不想讓它變成公開網址。
  * 代價是有大小上限（單則約 256KB），所以壓 JPEG + 只截表單範圍。 */
-async function snapForm(page, fp) {
+async function snapForm(page, fp, form) {
   try {
     // 表單外層 frame 和內層容器各有自己的捲軸，兩個都要捲到頂，
     // 否則最上面那排（填單人/請假人/代理人）會被切掉。
@@ -772,8 +846,10 @@ async function snapForm(page, fp) {
     // 是「整頁座標」，中間差一個 frame 位移。直接拿來用會裁歪（右半邊整排不見）。
     // 所以要拿 frame 自己的 boundingBox 當原點加回去。
     const fb = await fe.boundingBox();
-    const r = await fp.evaluate(() => {
-      const els = Array.from(document.querySelectorAll('input[id^="ESSQJ"], textarea[id^="ESSQJ"]'))
+    // ⚠️ 欄位 id 的開頭每張單不一樣（請假 ESSQJ、加班調休 ESSJBDX）。
+    // 寫死 ESSQJ 的話，批次代填那張加班調休單會一個欄位都框不到、整張截歪。
+    const r = await fp.evaluate((pfx) => {
+      const els = Array.from(document.querySelectorAll(`input[id^="${pfx}"], textarea[id^="${pfx}"]`))
         .filter((el) => el.offsetParent !== null);
       if (!els.length) return null;
       let l = 1e9, t = 1e9, rt = 0, b = 0;
@@ -784,7 +860,7 @@ async function snapForm(page, fp) {
         rt = Math.max(rt, c.right); b = Math.max(b, c.bottom);
       }
       return b > t ? { left: l, top: t, right: rt, bottom: b } : null;
-    });
+    }, (form && form.idPrefix) || "ESSQJ");
 
     let buf;
     if (fb && r) {

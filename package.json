@@ -2,7 +2,7 @@
   "name": "easyflow-bridge",
   "version": "1.0.0",
   "private": true,
-  "description": "在自己電腦上幫忙填 EasyFlow 簽核單的本機橋接程式（只填不送出）",
+  "description": "在自己電腦上幫忙填 EasyFlow 簽核單的本機橋接程式（填好等你確認，你按了才送出）",
   "type": "module",
   "scripts": {
     "setup": "node setup.mjs",

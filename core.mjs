@@ -164,8 +164,18 @@ export async function startBridge({ cfg, onLog = () => {}, onState = () => {} })
       });
       openBrowser = r.browser;      // 瀏覽器留著，讓使用者自己檢查草稿
 
+      // 截圖等全部跑完才傳（使用者要的是最後一次看完全部，不是邊跑邊跳）。
+      // 但一則一個人 —— Realtime 單則約 256KB，人數不固定，全部塞同一則一定會被丟掉。
+      // 中間隔一下，免得撞到每秒事件數上限（eventsPerSecond: 20）。
+      const shots = (r.shots || []).filter((x) => x && x.shot);
+      if (shots.length) log(`回傳 ${shots.length} 張截圖…`);
+      for (let i = 0; i < shots.length; i++) {
+        emit("batchshot", { requestId: rid, i, n: shots.length, name: shots[i].name, shot: shots[i].shot });
+        await new Promise((res) => setTimeout(res, 200));
+      }
+
       const okCount = r.results.filter((x) => x.ok).length;
-      emit("batchdone", { requestId: rid, form: req.form, label, results: r.results });
+      emit("batchdone", { requestId: rid, form: req.form, label, results: r.results, shots: shots.length });
       log(`批次完成：${okCount}/${r.results.length} 成功，都存成草稿`, okCount ? "ok" : "err");
       finish(true, "");
     } catch (e) {
