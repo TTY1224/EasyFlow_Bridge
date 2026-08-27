@@ -25,7 +25,7 @@ const SLOW_MO = 250;
  * 平常 2~3 秒就好。改成輪詢條件之後大部分步驟都是秒級完成。
  *
  * fn 回 truthy 就結束；丟例外當成「還沒好」（frame 重載時讀欄位會炸，很正常）。 */
-async function until(fn, { timeout = 30000, step = 400, page = null } = {}) {
+async function until(fn, { timeout = 30000, step = 250, page = null } = {}) {
   const t0 = Date.now();
   for (;;) {
     try {
@@ -245,17 +245,22 @@ function readRowsRaw(dlg) {
 async function pickPerson({ page, fp, form, name, say = () => {} }) {
   say(`選人：${name}…`);
   await fp.click(`#${form.f.person}_btn_icon`, { force: true });
-  // ⚠️ 這裡刻意用固定等待。試過改成「輪詢到搜尋框出現」，但這個對話框
-  // 是在 iframe 裡慢慢長出來的，條件判斷一直不成立、整個卡住 30 秒才逾時。
-  // 固定 6 秒反而穩，也沒差多少。
-  await page.waitForTimeout(6000);
-  const dlg = page.frames().find((f) => f.name() === "dialogIframe" || f.url().includes("F2Single"));
+
+  // 等視窗真的可以操作。⚠️ 判斷要用 locator().count() ——
+  // 之前用 frame.$() 一直判斷不成立、卡滿 30 秒才逾時（踩過）。
+  // 實測用 locator 大概 0.5 秒就好，原本固定等 6 秒都在白等。
+  const dlg = await until(async () => {
+    const d = page.frames().find((f) => f.name() === "dialogIframe" || f.url().includes("F2Single"));
+    if (!d) return null;
+    return (await d.locator("#txtSEARCH").count()) ? d : null;
+  }, { timeout: 25000, page });
   if (!dlg) throw new Error("選人視窗沒有開起來");
 
   await dlg.fill("#txtSEARCH", "");
   // 查詢鈕是隱藏的（Playwright 會拒絕點），用 DOM 直接觸發
   await dlg.evaluate(() => document.getElementById("btnSEARCH").click());
-  await page.waitForTimeout(6000);
+  // 剛開的視窗清單是空的，查完才會有東西 —— 等到有兩筆以上就是查回來了（實測 0.5 秒）
+  await until(async () => (await readRowsRaw(dlg)).length > 1, { timeout: 25000, page });
 
   const readRows = () => readRowsRaw(dlg);
 
@@ -266,16 +271,16 @@ async function pickPerson({ page, fp, form, name, say = () => {} }) {
     const link = dlg.locator("a").filter({ hasText: String(n) }).last();
     if (!(await link.count())) return false;
     await link.click({ force: true });
-    await page.waitForTimeout(4000);
+    // 翻頁的完成訊號不好判斷（新舊清單可能長得像），所以還是固定等，只是縮短一點
+    await page.waitForTimeout(3000);
     return true;
   };
 
   const selectRow = async (row) => {
     await dlg.locator("tr").filter({ hasText: row.name }).first().dblclick({ force: true });
-    // 等表單上的人真的換成他（選人會觸發一輪 postback 重帶部門職位）
-    await page.waitForTimeout(1500);
+    // 等表單上的人真的換成他（選人會觸發一輪 postback 重帶部門職位）。實測 0.7 秒。
     await until(async () => (await fp.inputValue(`#${form.f.person}_txt`)) === row.no,
-                { timeout: 25000, page });
+                { timeout: 25000, step: 250, page });
     const gotName = await fp.inputValue(`#${form.f.personName}_txt`).catch(() => "");
     const gotNo = await fp.inputValue(`#${form.f.person}_txt`).catch(() => "");
     if (gotNo !== row.no) throw new Error(`選人沒生效（表單上目前是「${gotNo} ${gotName}」）`);
