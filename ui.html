@@ -140,9 +140,35 @@
   .seg button:hover { background: rgba(255, 255, 255, .07); color: var(--text-1); }
   .seg button.on { background: var(--accent); color: #fff; font-weight: 600; }
   .seg button.on:hover { background: var(--accent); }
-  /* 執行中畫面那個小一號的（放在資訊卡右邊） */
-  .seg.sm { border-radius: var(--r-sm); }
-  .seg.sm button { padding: 4px 13px; font-size: 11px; }
+  /* 瀏覽器切換（執行中畫面，資訊卡右邊）
+     照主網站的做法：平行四邊形是 skewX(-9deg) 的**背景**，文字不歪。
+     高亮是一塊會滑過去的方塊，放在已經 skew 過的軌道裡面 —— 這樣它自己只要
+     translateX 就好，不用自己算斜邊，也不會跟 skew 打架。 */
+  .pseg { position: relative; display: inline-flex; --i: 0; --n: 2; }
+  .pseg .track {
+    position: absolute; inset: 0; overflow: hidden;
+    transform: skewX(-9deg); border-radius: 2px;
+    background: rgba(255, 255, 255, .04); border: 1px solid var(--fw-line);
+  }
+  .pseg .ind {
+    position: absolute; top: -1px; bottom: -1px; left: -1px;
+    width: var(--w, 50%);
+    background: linear-gradient(135deg, #f5ff5a, var(--fw-yellow));
+    box-shadow: 0 0 16px -3px rgba(234, 255, 0, .55);
+    transform: translateX(var(--x, 0));
+    /* 稍微過衝一下再回來，滑起來才有勁 */
+    transition: transform .42s cubic-bezier(.32, 1.5, .38, 1), width .42s cubic-bezier(.32, 1.5, .38, 1);
+  }
+  .pseg button {
+    position: relative; z-index: 1; flex: 1;
+    padding: 5px 15px; border: 0; border-radius: 0; background: transparent;
+    color: var(--text-3); font-size: 11px; font-weight: 600; letter-spacing: .04em;
+    transition: color .3s ease, text-shadow .3s ease;
+  }
+  .pseg button:hover { color: var(--text-2); }
+  /* 黃底配近黑的字（跟主網站的黃色平行四邊形標題一樣的做法） */
+  .pseg button.on { color: #14140f; font-weight: 700; text-shadow: none; }
+  .pseg button.on:hover { color: #14140f; }
 
   .err {
     margin-top: 15px; padding: 11px 13px; border-radius: var(--r-md);
@@ -247,6 +273,7 @@ const hhmm = (ts) => new Date(ts).toTimeString().slice(0, 8);
 let view = "";          // 目前畫的是哪個畫面，避免每次輪詢都重畫把輸入框清掉
 let logCount = -1;
 let logOpen = false;     // 動態預設收起來（要看的人自己展開）
+let syncBrowser = null;  // 把高亮移到目前這個瀏覽器（每次輪詢都對一次，位置就不會跑掉）
 let pickedBrowser = "";  // 使用者選的瀏覽器（空的就讓後端自動挑）
 
 async function api(path, body) {
@@ -365,7 +392,7 @@ function drawRunning(st) {
       <div class="glass who">
         <div><span>你的帳號</span><b>${esc(st.config.email || "")}</b></div>
         <div><span>EasyFlow</span><b>${esc(st.config.easyflowUser || "")}</b></div>
-        <div id="browserRow" style="display:none"><span>瀏覽器</span><div class="seg sm" id="browserSeg2"></div></div>
+        <div id="browserRow" style="display:none"><span>瀏覽器</span><div class="pseg" id="browserSeg2"></div></div>
       </div>
       <div class="note">這個視窗要留著開，關掉就等於下線。回網站跟 Woby 說話就可以了。</div>
       <button type="button" class="logt" id="logt">
@@ -402,26 +429,49 @@ function drawRunning(st) {
     // 瀏覽器：直接切，不用重新設定。只列這台電腦真的裝了的。
     fetch("/browsers").then((r) => r.json()).then(({ list }) => {
       if (!list || list.length < 2) return;            // 只有一個就不用給選了
-      const seg = document.getElementById("browserSeg2");
-      const paint = (cur) => {
-        seg.innerHTML = list.map((x) =>
-          `<button type="button" data-ch="${x.channel}" class="${x.channel === cur ? "on" : ""}">${esc(x.label)}</button>`).join("");
-        seg.querySelectorAll("button").forEach((b) => {
-          b.onclick = async () => {
-            const ch = b.dataset.ch;
-            if (ch === cur) return;
-            paint(ch);                                  // 先動起來，感覺才快
-            const r = await api("/browser", { channel: ch });
-            if (!r.ok) paint(cur);                      // 失敗就退回去
-          };
-        });
-      };
-      paint(st.config.browser || list[0].channel);
+      // ⚠️ 要先把這一排顯示出來再量按鈕 —— display:none 的元素 offsetWidth 是 0，
+      // 高亮會變成 2px 的一小條（踩過）。
       document.getElementById("browserRow").style.display = "";
+      const seg = document.getElementById("browserSeg2");
+      // 一次畫好就不再重畫 —— 切換只改 --i 讓高亮自己滑過去。
+      // （之前是每次切換都重畫 innerHTML，那樣元素被換掉，CSS 動畫根本跑不起來。）
+      seg.style.setProperty("--n", list.length);
+      seg.innerHTML = '<span class="track"><span class="ind"></span></span>'
+        + list.map((x) => `<button type="button" data-ch="${x.channel}">${esc(x.label)}</button>`).join("");
+      const btns = [...seg.querySelectorAll("button")];
+      let cur = st.config.browser || list[0].channel;
+      const slide = (ch) => {
+        const i = list.findIndex((x) => x.channel === ch);
+        if (i < 0) return;
+        const b = btns[i];
+        // 照真實按鈕的位置和寬度擺（Edge 57px、Chrome 73px，寬度不一樣，
+        // 用「軌道的一半」算會對不齊 —— 踩過）
+        seg.style.setProperty("--x", (b.offsetLeft - 1) + "px");
+        seg.style.setProperty("--w", (b.offsetWidth + 2) + "px");
+        btns.forEach((x, k) => x.classList.toggle("on", k === i));
+      };
+      slide(cur);
+      // 字體（Outfit）是 Google Fonts 非同步載的，載完按鈕會變寬 —— 再量一次
+      if (document.fonts && document.fonts.ready) document.fonts.ready.then(() => slide(cur));
+      // 每次輪詢都照後端的設定對一次位置。這樣就算建立的時候剛好還沒拿到設定
+      // （或設定被別的地方改掉），高亮也會自己回到對的那一格。
+      syncBrowser = (ch) => { if (ch && ch !== cur) { cur = ch; slide(ch); } };
+      btns.forEach((b) => {
+        b.onclick = async () => {
+          const ch = b.dataset.ch;
+          if (ch === cur) return;
+          const prev = cur;
+          cur = ch;
+          slide(ch);                                    // 先滑過去，感覺才快
+          const r = await api("/browser", { channel: ch });
+          if (!r.ok) { cur = prev; slide(prev); }       // 失敗就滑回去
+        };
+      });
     }).catch(() => { /* 列不出來就算了，設定畫面還是可以改 */ });
 
     logCount = -1;
   }
+  if (syncBrowser) syncBrowser(st.config.browser);
   if (st.log.length !== logCount) {
     logCount = st.log.length;
     const el = document.getElementById("log");
