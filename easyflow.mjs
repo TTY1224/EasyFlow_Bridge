@@ -122,11 +122,17 @@ const BTN_SEND = "#MasterPage_btnPreCreateToolSendForm";
  * 主旨欄一律是「此欄不需填寫」，所以**只能靠「填表日期時間」辨識是哪一張**。 */
 const DRAFT_BOX = { url: "../FormBox/LoadBox.aspx", id: "LoadBox", title: "草稿資料匣", w: "71" };
 
-/* 三顆唯讀查詢按鈕。id 與跳出來的資料頁都是實際點過確認的。 */
+/* 唯讀查詢。按鈕 id 與跳出來的資料頁都是實際點過確認的。
+ * ⚠️ **同一個 id 在不同單上意思不一樣**，不要共用：
+ *     請假單(ESSF07) 的 #btnRecord   ＝ 請假記錄
+ *     加班調休單(ESSF06) 的 #btnRecord ＝ 可休時數（也就是補休時數）
+ * 所以每一種查詢都要記清楚「開哪張單、按哪顆」。 */
 export const QUERIES = {
-  balance: { label: "可休時數", btn: "#btnDetail", page: "ESSF07_Detail.aspx" },
-  history: { label: "請假記錄", btn: "#btnRecord", page: "ESSF07_Record.aspx" },
-  punch: { label: "刷卡記錄", btn: "#btnCardRecord", page: "ESSF07_EmpRankRecord.aspx" },
+  balance: { label: "可休時數", form: "leave", btn: "#btnDetail", page: "ESSF07_Detail.aspx" },
+  history: { label: "請假記錄", form: "leave", btn: "#btnRecord", page: "ESSF07_Record.aspx" },
+  punch: { label: "刷卡記錄", form: "leave", btn: "#btnCardRecord", page: "ESSF07_EmpRankRecord.aspx" },
+  // 補休（加班換來的假）：欄位有加班時間、每筆調休時間、實際已調休、調休截止日期…
+  comp: { label: "補休時數", form: "overtime", btn: "#btnRecord", page: "ESSF06_Record.aspx" },
 };
 
 /* 開瀏覽器並登入。回傳之後要重複用的東西（page、功能樹 frame）。
@@ -740,13 +746,17 @@ async function closeDialog(page, fp) {
 /* 填請假單，填完按「計算」就停手。
  * ⚠️ 這個函式永遠不會按存檔／暫存／送簽。送出與否一律由人決定。 */
 export async function fillLeave({ cfg, req, say = () => {} }) {
-  const ses = await openForm({ cfg, form: "leave", say });
+  // 單張也可以是加班調休（ESSF06）—— 幫自己填，不用選人（表單預設就是登入的人）。
+  const kind = req.form === "overtime" ? "overtime" : "leave";
+  const ses = await openForm({ cfg, form: kind, say });
   const { browser, page, fp } = ses;
-  const form = FORMS.leave;
+  const form = FORMS[kind];
 
-  // 假別只能用選擇器選，打字會被擋（系統會跳「假別還沒有選喔~」）
-  say(`選假別 ${req.code}…`);
-  await pickLeaveType({ page, fp, form, code: req.code });
+  if (form.f.code) {
+    // 假別只能用選擇器選，打字會被擋（系統會跳「假別還沒有選喔~」）
+    say(`選假別 ${req.code}…`);
+    await pickLeaveType({ page, fp, form, code: req.code });
+  }
 
   say("填日期與原因…");
   // ⚠️ 時間沒指定就不要碰。EasyFlow 會照那個人的班別帶（選手 12:00~22:00、
@@ -767,8 +777,11 @@ export async function fillLeave({ cfg, req, say = () => {} }) {
     return (h && parseFloat(h) > 0) || (ses.notes && ses.notes.last);
   }, { timeout: 12000, page });
   const hours = await fp.inputValue(`#${form.f.hours}_txt`).catch(() => "");
-  const days = await fp.inputValue(`#${form.f.days}_txt`).catch(() => "");
-  const typeName = await fp.inputValue(`#${form.f.typeName}_txt`).catch(() => "");
+  // 天數/假別名稱只有請假單有，加班調休單沒有這兩個欄位
+  const days = form.f.days ? await fp.inputValue(`#${form.f.days}_txt`).catch(() => "") : "";
+  const typeName = form.f.typeName
+    ? await fp.inputValue(`#${form.f.typeName}_txt`).catch(() => "")
+    : form.label;
   const shot = await snapForm(page, fp, form);
 
   // 時數算不出來就不能說「填好了」。實測：連假的日期（例如 2026/09/25、09/28）
@@ -796,7 +809,7 @@ export async function fillLeave({ cfg, req, say = () => {} }) {
 export async function runQuery({ cfg, kind, say = () => {} }) {
   const meta = QUERIES[kind];
   if (!meta) throw new Error(`未知的查詢類型：${kind}`);
-  const { browser, page, fp } = await openForm({ cfg, form: "leave", say });
+  const { browser, page, fp } = await openForm({ cfg, form: meta.form || "leave", say });
   try {
     say(`讀取「${meta.label}」…`);
     await fp.click(meta.btn, { force: true });

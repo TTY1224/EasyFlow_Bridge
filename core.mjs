@@ -26,10 +26,12 @@ export async function startBridge({ cfg, onLog = () => {}, onState = () => {} })
 
   // 只認「用我的授權碼簽過」的請求。簽章涵蓋所有會被填進表單的欄位，
   // 所以別人拿到一張舊簽章也沒辦法改成別的日期或假別再重送。
+  // ⚠️ 單別（請假/加班調休）也要進簽章，否則有人能把「請假」改成「加班調休」再重送
   const verifyFill = (p) =>
-    p && p.sig && p.requestId &&
+    p && p.sig && p.requestId && (!p.form || FORMS[p.form]) &&
     Math.abs(Date.now() - Number(p.ts || 0)) <= 180000 &&
-    safeEq(hmac([p.requestId, p.ts, p.email, p.code, p.start, p.startT, p.end, p.endT, p.reason].join("|")), p.sig);
+    safeEq(hmac([p.requestId, p.ts, p.email, p.form || "leave", p.code,
+                 p.start, p.startT, p.end, p.endT, p.reason].join("|")), p.sig);
 
   // 查詢的簽章夾一個 "q" 當領域標記，所以填單簽章不可能被拿去當查詢用（反之亦然）
   const verifyQuery = (p) =>
@@ -81,7 +83,8 @@ export async function startBridge({ cfg, onLog = () => {}, onState = () => {} })
     };
 
     try {
-      log(`收到填單請求：${req.code} ${req.start} ${req.startT}～${req.end} ${req.endT}`, "task");
+      log(`收到填單請求：${FORMS[req.form || "leave"].label} ${req.code || ""} `
+        + `${req.start} ${req.startT}～${req.end} ${req.endT}`, "task");
       if (openBrowser) { try { await openBrowser.close(); } catch { /* ignore */ } openBrowser = null; }
 
       const r = await fillLeave({ cfg, req, say });
