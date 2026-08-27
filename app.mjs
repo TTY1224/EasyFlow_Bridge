@@ -43,6 +43,10 @@ const LOG_MAX = 200;
 const pushLog = (l) => { S.log.push(l); if (S.log.length > LOG_MAX) S.log.splice(0, S.log.length - LOG_MAX); };
 
 let bridge = null;
+// ⚠️ 這是「bridge 正在用的那個 cfg 物件本身」（不是複本）。
+// core.mjs 每次填單都從這個物件讀 browser，所以改它就等於即時換瀏覽器，
+// 不用重連、也不用叫使用者重新設定。
+let liveCfg = null;
 let lastPing = Date.now();   // 介面最後一次來問狀態的時間（用來判斷視窗還在不在）
 let quitting = false;
 
@@ -61,6 +65,7 @@ async function connect(cfg) {
   }
   S.screen = "running";
   S.config = publicConfig(cfg);
+  liveCfg = cfg;
   try {
     const { startBridge } = await import("./core.mjs");
     bridge = await startBridge({
@@ -210,6 +215,26 @@ const server = http.createServer(async (req, res) => {
     const target = (S.configFull?.appUrl || DEFAULTS.appUrl) + "/?app=leavesetup";
     spawn("cmd", ["/c", "start", "", target], { detached: true, stdio: "ignore", windowsHide: true }).unref();
     return send(200, JSON.stringify({ ok: true }));
+  }
+  // 換瀏覽器。刻意**不重連、不重跑設定檢查** —— 只要改掉 bridge 正在用的那個 cfg，
+  // 下一次填單就會用新的瀏覽器開。（這個視窗本身沒辦法換，要下次開才會換。）
+  if (url === "/browser") {
+    const b = await readBody(req);
+    const ch = String(b.channel || "");
+    if (!BROWSERS[ch] || !browserExe(ch)) {
+      return send(400, JSON.stringify({ ok: false, error: "這台電腦找不到那個瀏覽器" }));
+    }
+    try {
+      const cfg = liveCfg || cfgStore.load();
+      cfg.browser = ch;                     // 改的是同一個物件，所以馬上生效
+      cfgStore.save(cfg);                   // 存起來，下次開也記得
+      liveCfg = cfg;
+      S.config = { ...S.config, browser: ch };
+      pushLog({ text: `填單改用 ${BROWSERS[ch].label} 了（這個視窗要下次開才會跟著換）`, kind: "ok", at: Date.now() });
+      return send(200, JSON.stringify({ ok: true, browser: ch }));
+    } catch (e) {
+      return send(500, JSON.stringify({ ok: false, error: String(e?.message || e) }));
+    }
   }
   if (url === "/quit") { send(200, JSON.stringify({ ok: true })); return shutdown(); }
 

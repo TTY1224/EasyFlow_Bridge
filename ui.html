@@ -140,6 +140,9 @@
   .seg button:hover { background: rgba(255, 255, 255, .07); color: var(--text-1); }
   .seg button.on { background: var(--accent); color: #fff; font-weight: 600; }
   .seg button.on:hover { background: var(--accent); }
+  /* 執行中畫面那個小一號的（放在資訊卡右邊） */
+  .seg.sm { border-radius: var(--r-sm); }
+  .seg.sm button { padding: 4px 13px; font-size: 11px; }
 
   .err {
     margin-top: 15px; padding: 11px 13px; border-radius: var(--r-md);
@@ -176,10 +179,25 @@
     background: rgba(234, 255, 0, .05); border-left: 2px solid var(--spark);
     color: var(--text-2);
   }
-  .logh {
-    font-size: 9px; font-weight: 700; letter-spacing: .18em; text-transform: uppercase;
-    color: var(--accent); margin-bottom: 8px;
+  /* 動態：預設收起來，想看的人自己點開 */
+  .logt {
+    display: flex; align-items: center; gap: 9px; width: 100%;
+    padding: 9px 12px; border-radius: var(--r-md);
+    background: transparent; border: 1px solid var(--fw-line);
+    color: var(--text-3); font-size: 11px; font-weight: 600; letter-spacing: .1em;
+    text-transform: uppercase; text-align: left;
   }
+  .logt:hover { background: rgba(255, 255, 255, .04); color: var(--text-2); }
+  .logt .ar { color: var(--accent); font-size: 9px; transition: transform .18s; }
+  .logt.open .ar { transform: rotate(90deg); }
+  /* 收起來的時候在標題旁邊顯示最後一句，這樣不用展開也知道剛剛發生什麼 */
+  .logt .last {
+    margin-left: auto; text-transform: none; letter-spacing: 0; font-weight: 400;
+    font-size: 11px; color: var(--text-3);
+    max-width: 58%; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+  }
+  .log { margin-top: 8px; }
+  .log[hidden] { display: none; }
   .log {
     border-radius: var(--r-md); background: rgba(0, 0, 0, .35);
     border: 1px solid rgba(90, 150, 250, .12);
@@ -228,6 +246,7 @@ const hhmm = (ts) => new Date(ts).toTimeString().slice(0, 8);
 
 let view = "";          // 目前畫的是哪個畫面，避免每次輪詢都重畫把輸入框清掉
 let logCount = -1;
+let logOpen = false;     // 動態預設收起來（要看的人自己展開）
 let pickedBrowser = "";  // 使用者選的瀏覽器（空的就讓後端自動挑）
 
 async function api(path, body) {
@@ -346,10 +365,13 @@ function drawRunning(st) {
       <div class="glass who">
         <div><span>你的帳號</span><b>${esc(st.config.email || "")}</b></div>
         <div><span>EasyFlow</span><b>${esc(st.config.easyflowUser || "")}</b></div>
+        <div id="browserRow" style="display:none"><span>瀏覽器</span><div class="seg sm" id="browserSeg2"></div></div>
       </div>
       <div class="note">這個視窗要留著開，關掉就等於下線。回網站跟 Woby 說話就可以了。</div>
-      <div class="logh">動態</div>
-      <div class="log" id="log"></div>`;
+      <button type="button" class="logt" id="logt">
+        <span class="ar">▶</span><span>動態</span><span class="last" id="logLast"></span>
+      </button>
+      <div class="log" id="log" hidden></div>`;
     document.getElementById("footer").innerHTML = `
       <button class="ghost" id="reset">重新設定</button>
       <button class="ghost sp" id="quit">結束</button>`;
@@ -362,6 +384,42 @@ function drawRunning(st) {
         + 'color:rgba(236,240,250,.4);font-family:Outfit,\'Noto Sans TC\',sans-serif;font-size:13px">'
         + '已結束，可以關掉這個視窗了</div>';
     };
+    // 動態：點標題才展開。收起來的時候旁邊會顯示最後一句。
+    const lt = document.getElementById("logt");
+    lt.onclick = () => {
+      logOpen = !logOpen;
+      lt.classList.toggle("open", logOpen);
+      const el = document.getElementById("log");
+      el.hidden = !logOpen;
+      document.getElementById("logLast").style.display = logOpen ? "none" : "";
+      if (logOpen) {
+        el.scrollTop = el.scrollHeight;
+        // 視窗不高，展開後把畫面往下捲，不然剛展開的東西在下面看不到
+        document.getElementById("main").scrollTop = 99999;
+      }
+    };
+
+    // 瀏覽器：直接切，不用重新設定。只列這台電腦真的裝了的。
+    fetch("/browsers").then((r) => r.json()).then(({ list }) => {
+      if (!list || list.length < 2) return;            // 只有一個就不用給選了
+      const seg = document.getElementById("browserSeg2");
+      const paint = (cur) => {
+        seg.innerHTML = list.map((x) =>
+          `<button type="button" data-ch="${x.channel}" class="${x.channel === cur ? "on" : ""}">${esc(x.label)}</button>`).join("");
+        seg.querySelectorAll("button").forEach((b) => {
+          b.onclick = async () => {
+            const ch = b.dataset.ch;
+            if (ch === cur) return;
+            paint(ch);                                  // 先動起來，感覺才快
+            const r = await api("/browser", { channel: ch });
+            if (!r.ok) paint(cur);                      // 失敗就退回去
+          };
+        });
+      };
+      paint(st.config.browser || list[0].channel);
+      document.getElementById("browserRow").style.display = "";
+    }).catch(() => { /* 列不出來就算了，設定畫面還是可以改 */ });
+
     logCount = -1;
   }
   if (st.log.length !== logCount) {
@@ -370,7 +428,10 @@ function drawRunning(st) {
     el.innerHTML = st.log.length
       ? st.log.map((l) => `<div class="ln ${l.kind}"><span class="tm">${hhmm(l.at)}</span><span class="tx">${esc(l.text)}</span></div>`).join("")
       : '<div class="empty">還沒有動作。到網站上跟 Woby 說「幫我請假」試試。</div>';
-    el.scrollTop = el.scrollHeight;
+    if (logOpen) el.scrollTop = el.scrollHeight;
+    // 收起來時把最後一句放在標題旁邊
+    const lastEl = document.getElementById("logLast");
+    if (lastEl) lastEl.textContent = logOpen || !st.log.length ? "" : st.log[st.log.length - 1].text;
   }
 }
 
