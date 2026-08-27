@@ -15,7 +15,7 @@ import http from "node:http";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { spawn } from "node:child_process";
+import { spawn, execFile } from "node:child_process";
 import { fileURLToPath } from "node:url";
 import * as cfgStore from "./config.mjs";
 // core.mjs（supabase-js）和 verify.mjs（playwright-core）刻意**不在這裡 import**：
@@ -57,6 +57,7 @@ let bridge = null;
 // 不用重連、也不用叫使用者重新設定。
 let liveCfg = null;
 let lastPing = Date.now();   // 介面最後一次來問狀態的時間（用來判斷視窗還在不在）
+let switching = 0;           // 正在換瀏覽器視窗的時間戳（這段時間的 /bye 不算使用者關窗）
 let quitting = false;
 
 function publicConfig(c) {
@@ -206,8 +207,14 @@ const server = http.createServer(async (req, res) => {
   if (url === "/logo") return send(200, logoDataUri, "text/plain");
   if (url === "/state") { lastPing = Date.now(); return send(200, JSON.stringify(S)); }
   if (url === "/browsers") return send(200, JSON.stringify({ list: installedBrowsers() }));
-  // 視窗被關掉時瀏覽器會用 sendBeacon 打這裡，這是最快、最準的收工訊號
-  if (url === "/bye") { send(200, "{}"); return shutdown(); }
+  // 視窗被關掉時瀏覽器會用 sendBeacon 打這裡，這是最快、最準的收工訊號。
+  // ⚠️ 但換瀏覽器的時候我們自己會關掉舊視窗，那個 /bye 不能當成「使用者要收工」，
+  // 不然一按切換整個橋接就跟著關掉了。
+  if (url === "/bye") {
+    send(200, "{}");
+    if (Date.now() - switching < 15000) return;   // 換視窗期間的 /bye 一律忽略
+    return shutdown();
+  }
 
   if (url === "/setup") {
     const b = await readBody(req);
@@ -235,11 +242,14 @@ const server = http.createServer(async (req, res) => {
     }
     try {
       const cfg = liveCfg || cfgStore.load();
-      cfg.browser = ch;                     // 改的是同一個物件，所以馬上生效
+      const old = cfg.browser === "chrome" ? "chrome" : "msedge";
+      cfg.browser = ch;                     // 改的是同一個物件，所以填單馬上生效
       cfgStore.save(cfg);                   // 存起來，下次開也記得
       liveCfg = cfg;
       S.config = { ...S.config, browser: ch };
-      pushLog({ text: `填單改用 ${BROWSERS[ch].label} 了（這個視窗要下次開才會跟著換）`, kind: "ok", at: Date.now() });
+      pushLog({ text: `改用 ${BROWSERS[ch].label} 了`, kind: "ok", at: Date.now() });
+      // 這個視窗也當場換過去（開新的 → 等它活起來 → 關舊的）。不 await：先回應畫面。
+      if (old !== ch) switchWindow(old, server.address().port);
       return send(200, JSON.stringify({ ok: true, browser: ch }));
     } catch (e) {
       return send(500, JSON.stringify({ ok: false, error: String(e?.message || e) }));
@@ -378,6 +388,35 @@ async function runUpdate() {
     S.update.msg = "更新失敗：" + String(e?.message || e).slice(0, 160);
     pushLog({ text: S.update.msg, kind: "err", at: Date.now() });
   }
+}
+
+/* 只關掉「我們自己開的」那個瀏覽器視窗。
+   ⚠️ 一定要用 profile 目錄比對，不能看程式名 —— 不然會把使用者自己在用的
+   Chrome/Edge 一起關掉。我們的 profile 是 efbridge-ui-<瀏覽器>，全機唯一。 */
+function closeOurWindow(channel) {
+  const dir = "efbridge-ui-" + channel;
+  return new Promise((res) => {
+    execFile("powershell", ["-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-Command",
+      `Get-CimInstance Win32_Process -Filter "Name='chrome.exe' OR Name='msedge.exe'"`
+      + ` | Where-Object { $_.CommandLine -like '*${dir}*' }`
+      + ` | ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }`],
+      { windowsHide: true }, () => res());
+  });
+}
+
+/* 切換瀏覽器：先用新的開一個視窗，等它真的活起來，再把舊的關掉。
+   順序不能反 —— 先關舊的會有一瞬間畫面上什麼都沒有，使用者會以為當掉了。 */
+async function switchWindow(oldChannel, port) {
+  switching = Date.now();
+  const before = lastPing;
+  openWindow(port);
+  // 等新視窗來要狀態（最多 8 秒）。它一開始問，就代表畫面已經在了。
+  for (let i = 0; i < 32 && lastPing === before; i++) await new Promise((r) => setTimeout(r, 250));
+  await closeOurWindow(oldChannel);
+  /* ⚠️ 這裡**不要**把 switching 歸零，讓那 15 秒的保護期自然過完。
+   * 踩過：關掉舊視窗之後，它的 /bye（sendBeacon）會晚個幾百毫秒才送到，
+   * 如果那時保護期已經被歸零，橋接就會以為「使用者關窗了」而整個關掉 ——
+   * 症狀是切換瀏覽器切到一半，整支程式沒了。 */
 }
 
 async function shutdown() {
