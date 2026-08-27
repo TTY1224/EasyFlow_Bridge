@@ -100,30 +100,33 @@ export async function download(url, onProgress = () => {}) {
   return src;
 }
 
-/* 產生 updater.bat 並交給它接手，然後自己退場。
-   ⚠️ 這支 .bat 是純 ASCII：中文寫進 .bat 在不同的 codepage 下會變亂碼甚至跑掉。 */
+/* 產生 updater 並交給它接手，然後自己退場。
+ *
+ * ⚠️ 兩個踩過的坑：
+ * ① **不要用 `tasklist | find` 等自己死掉**。實際發生過：更新按下去之後，
+ *    畫面上就卡著一個標題是 find "104064" 的小黑窗，永遠不動 ——
+ *    find 在等 stdin，而那個 pipe 在這種啟動方式下不會如預期關掉。
+ *    改成叫 PowerShell 等（一支程式、沒有 pipe，行為單純）。
+ * ② **不要跳出小黑窗**。spawn 加 detached 之後 windowsHide 壓不住 cmd 的主控台，
+ *    所以改成跟主程式一樣的做法：寫一支 .vbs，用 wscript 隱藏執行（視窗樣式 0）。
+ *
+ * 另外**不要在 .bat 裡刪掉自己所在的資料夾** —— cmd 是邊執行邊讀檔的。
+ * 暫存夾交給下一次 download() 開頭清掉就好。
+ */
 export function handOff({ src, dst, pid, onLog = () => {} }) {
   const bat = path.join(TMP, "updater.bat");
+  const vbs = path.join(TMP, "updater.vbs");
+
+  // ⚠️ .bat 一律純 ASCII：中文寫進去，換一個 codepage 就變亂碼甚至跑掉
   const lines = [
     "@echo off",
     "rem EasyFlow bridge updater - generated automatically, safe to delete",
-    "setlocal",
-    "rem wait for the bridge process to exit (max ~30s)",
-    "set /a n=0",
-    ":wait",
-    `tasklist /FI "PID eq ${pid}" 2>nul | find "${pid}" >nul`,
-    "if errorlevel 1 goto docopy",
-    "set /a n+=1",
-    "if %n% GEQ 30 goto docopy",
-    "ping -n 2 127.0.0.1 >nul",
-    "goto wait",
-    "",
-    ":docopy",
+    "rem wait for the bridge process to exit (max 30s), then swap the files",
+    `powershell -NoProfile -NonInteractive -ExecutionPolicy Bypass -Command "$i=0; while ((Get-Process -Id ${pid} -ErrorAction SilentlyContinue) -and ($i -lt 30)) { Start-Sleep -Seconds 1; $i++ }"`,
     "rem /E keeps extra files the user may have put there; /IS overwrites same-size files",
-    `robocopy "${src}" "${dst}" /E /IS /R:2 /W:1 /NFL /NDL /NJH /NJS /NP >nul`,
+    `robocopy "${src}" "${dst}" /E /IS /R:3 /W:1 /NFL /NDL /NJH /NJS /NP >nul`,
     "if errorlevel 8 goto failed",
     `start "" wscript.exe "${path.join(dst, "EasyFlow_bridge.vbs")}"`,
-    `rd /s /q "${TMP}" 2>nul`,
     "exit /b 0",
     "",
     ":failed",
@@ -131,7 +134,13 @@ export function handOff({ src, dst, pid, onLog = () => {} }) {
     "pause",
   ];
   fs.writeFileSync(bat, lines.join("\r\n"), "ascii");
+
+  // 視窗樣式 0 ＝ 完全隱藏（跟主程式的啟動器同一招）
+  fs.writeFileSync(vbs,
+    'Set sh = CreateObject("WScript.Shell")\r\n'
+    + `sh.Run """${bat}""", 0, False\r\n`, "ascii");
+
   onLog("交給更新程式，視窗會自己關掉再開起來…");
-  // detached：這支 .bat 要活得比我久
-  spawn("cmd", ["/c", bat], { detached: true, stdio: "ignore", windowsHide: true }).unref();
+  // detached：這支要活得比我久
+  spawn("wscript.exe", [vbs], { detached: true, stdio: "ignore" }).unref();
 }
