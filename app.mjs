@@ -292,10 +292,10 @@ function openWindow(port) {
   const args = [
     `--app=http://127.0.0.1:${port}/`,
     `--user-data-dir=${profile}`,     // 專屬 profile：確保這是「我們的」行程，關窗抓得到
-    // 高度只留「動態收起來」時剛好夠的量（實測內容需要 413px，加上標題列的餘裕）。
+    // 高度只留「動態收起來」時剛好夠的量（實測內容需要 357px，加上標題列的餘裕）。
     // 以前是 760 —— 那是動態展開時的長度，一開起來下面一大片空白。
     // 展開動態的時候 main 自己會捲，不用把視窗開那麼高。
-    "--window-size=520,468",
+    "--window-size=520,410",
     "--no-first-run",
     "--no-default-browser-check",
   ];
