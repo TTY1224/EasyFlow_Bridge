@@ -7,7 +7,7 @@
  */
 import { createClient } from "@supabase/supabase-js";
 import crypto from "node:crypto";
-import { fillLeave, runQuery, fillBatch, QUERIES, FORMS } from "./easyflow.mjs";
+import { fillLeave, runQuery, fillBatch, sendForm, saveDraft, sendDrafts, QUERIES, FORMS } from "./easyflow.mjs";
 import { checkToken } from "./verify.mjs";
 
 export async function startBridge({ cfg, onLog = () => {}, onState = () => {} }) {
@@ -45,12 +45,25 @@ export async function startBridge({ cfg, onLog = () => {}, onState = () => {} })
     safeEq(hmac([p.requestId, p.ts, p.email, "b", p.form, p.people.join(","),
                  p.code, p.start, p.startT, p.end, p.endT, p.reason].join("|")), p.sig);
 
+  // 單張填完後「確定發送／儲存草稿／取消」。動作也要簽 —— 不然有人能把「存草稿」改成「送出」。
+  const verifyAct = (p) =>
+    p && p.sig && p.requestId && ["send", "draft", "cancel"].includes(p.action) &&
+    Math.abs(Date.now() - Number(p.ts || 0)) <= 180000 &&
+    safeEq(hmac([p.requestId, p.ts, p.email, "a", p.action].join("|")), p.sig);
+
+  // 批次的「一起送出」。草稿的識別（填表日期時間）也一起簽。
+  const verifySend = (p) =>
+    p && p.sig && p.requestId && Array.isArray(p.drafts) && p.drafts.length &&
+    Math.abs(Date.now() - Number(p.ts || 0)) <= 180000 &&
+    safeEq(hmac([p.requestId, p.ts, p.email, "s", p.drafts.join(",")].join("|")), p.sig);
+
   const supa = createClient(conn.supabaseUrl, conn.supabaseKey, { realtime: { params: { eventsPerSecond: 20 } } });
   const channel = supa.channel(conn.channel, { config: { broadcast: { self: false }, presence: { key: "bridge" } } });
   const emit = (event, payload) => { try { channel.send({ type: "broadcast", event, payload }); } catch { /* 還沒連上 */ } };
 
   let busy = false;
-  let openBrowser = null;   // 前一張填好但還沒送出的單，開新的之前先關掉
+  let openBrowser = null;   // 前一張填好但還沒處理掉的單，開新的之前先關掉
+  let pending = null;       // 那張單的操作把手（page/outer/notes），使用者按三顆時要用
   let stopped = false;
 
   async function handleFill(req) {
@@ -73,6 +86,7 @@ export async function startBridge({ cfg, onLog = () => {}, onState = () => {} })
 
       const r = await fillLeave({ cfg, req, say });
       openBrowser = r.browser;
+      pending = { page: r.page, outer: r.outer, notes: r.notes };
       emit("filled", { requestId: rid, code: req.code, typeName: r.typeName, hours: r.hours, days: r.days, shot: r.shot });
       log(`${r.typeName}　時數 ${r.hours}　天數 ${r.days}`, "ok");
       finish(true, "");
@@ -80,6 +94,7 @@ export async function startBridge({ cfg, onLog = () => {}, onState = () => {} })
       // 「算出 0 小時」這種情況要把視窗留著，讓使用者自己改日期重算
       if (e?.keepBrowser) {
         openBrowser = e.keepBrowser;
+        if (e.session) pending = e.session;      // 讓使用者改完還是可以按那三顆
         log("瀏覽器視窗留著，你可以直接改日期再按「計算」", "warn");
       }
       finish(false, String(e?.message || e).slice(0, 250));
@@ -158,7 +173,89 @@ export async function startBridge({ cfg, onLog = () => {}, onState = () => {} })
     }
   }
 
+  /* 單張填完之後，使用者選了「確定發送 / 儲存草稿 / 取消」。
+     🚨 send 這條是唯一會真的送出表單的路徑，而且一定是使用者按了才會走到。 */
+  async function handleAct(req) {
+    const rid = String(req.requestId);
+    const say = (text) => { log("　" + text); emit("status", { requestId: rid, text }); };
+    const done = (ok, error, result) => emit("acted", { requestId: rid, action: req.action, ok, error: error || "", result: result || "" });
+
+    if (!pending || !openBrowser) {
+      done(false, "那張表單已經不在了（瀏覽器關掉或已經處理過）");
+      return;
+    }
+    busy = true;
+    onState({ busy: true, task: req.action === "send" ? "傳送" : req.action === "draft" ? "存草稿" : "取消" });
+    try {
+      if (req.action === "send") {
+        log("使用者選擇【確定發送】", "task");
+        const msg = await sendForm({ page: pending.page, outer: pending.outer, notes: pending.notes, say });
+        log("已送出簽核" + (msg ? "（" + msg + "）" : ""), "ok");
+        done(true, "", msg);
+      } else if (req.action === "draft") {
+        log("使用者選擇【儲存草稿】", "task");
+        await saveDraft({ page: pending.page, outer: pending.outer, notes: pending.notes, say });
+        log("已存成草稿，沒有送出", "ok");
+        done(true, "", "已存成草稿");
+      } else {
+        log("使用者選擇【取消】，關掉表單不儲存", "task");
+        done(true, "", "已取消");
+      }
+      // 送出／存草稿／取消之後這張就結束了，關掉瀏覽器
+      try { await openBrowser.close(); } catch { /* ignore */ }
+      openBrowser = null;
+      pending = null;
+    } catch (e) {
+      const msg = String(e && e.message ? e.message : e).slice(0, 250);
+      log(msg, "err");
+      done(false, msg);
+    } finally {
+      busy = false;
+      onState({ busy: false, task: "" });
+    }
+  }
+
+  /* 🚨 批次的「一起送出」：把剛才存的那幾張草稿一張一張打開、按傳送。不可逆。 */
+  async function handleSendDrafts(req) {
+    busy = true;
+    onState({ busy: true, task: "送出草稿" });
+    const rid = String(req.requestId);
+    const say = (text) => { log("　" + text); emit("status", { requestId: rid, text }); };
+    let finished = false;
+    const finish = (ok, error) => {
+      if (finished) return;
+      finished = true; busy = false;
+      onState({ busy: false, task: "" });
+      emit("done", { requestId: rid, ok, error: error || "" });
+    };
+    try {
+      log(`使用者選擇【全部送出】：${req.drafts.length} 張草稿`, "task");
+      if (openBrowser) { try { await openBrowser.close(); } catch { /* ignore */ } openBrowser = null; pending = null; }
+      const r = await sendDrafts({
+        cfg, whens: req.drafts, say,
+        onEach: (one) => emit("sentone", { requestId: rid, ...one }),
+      });
+      openBrowser = r.browser;
+      const ok = r.results.filter((x) => x.ok).length;
+      emit("sentdone", { requestId: rid, results: r.results });
+      log(`送出完成：${ok}/${r.results.length} 張`, ok ? "ok" : "err");
+      finish(true, "");
+    } catch (e) {
+      finish(false, String(e && e.message ? e.message : e).slice(0, 250));
+    }
+  }
+
   channel
+    .on("broadcast", { event: "a" }, ({ payload }) => {
+      if (!verifyAct(payload)) { log("收到簽章無效的操作請求，已忽略", "warn"); return; }
+      if (busy) { emit("acted", { requestId: payload.requestId, action: payload.action, ok: false, error: "正在處理上一個請求，請稍候" }); return; }
+      handleAct(payload);
+    })
+    .on("broadcast", { event: "s" }, ({ payload }) => {
+      if (!verifySend(payload)) { log("收到簽章無效的送出請求，已忽略", "warn"); return; }
+      if (busy) { emit("done", { requestId: payload.requestId, ok: false, error: "正在處理上一個請求，請稍候" }); return; }
+      handleSendDrafts(payload);
+    })
     .on("broadcast", { event: "b" }, ({ payload }) => {
       if (!verifyBatch(payload)) { log("收到簽章無效的批次請求，已忽略", "warn"); return; }
       if (busy) { emit("done", { requestId: payload.requestId, ok: false, error: "正在處理上一個請求，請稍候" }); return; }

@@ -101,6 +101,25 @@ export const FORMS = {
  */
 const BTN_DRAFT = "#MasterPage_btnCreateToolSaveForm";
 
+/* 🚨 真正的送出鈕。按下去表單就進簽核流程，收不回來。
+ *
+ * 驗證方式：開一張完全空白的請假單按下去，系統依序跳
+ *   ① 事後補假單時，請務必於備註欄位載明請假事由。   （例行提示）
+ *   ② 是否確定將填寫好的表單傳送出去?               （確認框）
+ *   ③ 假別還沒有選喔~                              （被擋下來）
+ * 所以這顆確實是送出，而且沒填完的單系統自己會擋。
+ *
+ * ⚠️ 注意②那個確認框：我們的 dialog handler 會自動按確定。
+ * 也就是說**唯一的保護就是「除非使用者明講要送出，否則永遠不呼叫 sendForm()」**。
+ * 這支檔案裡只有 sendForm() 會碰它，其他地方一律用 BTN_DRAFT。
+ */
+const BTN_SEND = "#MasterPage_btnPreCreateToolSendForm";
+
+/* 草稿資料匣。清單上每個儲存格的 onclick 是
+ *   LoadBoxItem("ESSF07","EPI/EPIE001/EPIE001.aspx?FormID=ESSF07","Create","AutoNumber","請假申請","2026/08/27 11:34:40")
+ * 主旨欄一律是「此欄不需填寫」，所以**只能靠「填表日期時間」辨識是哪一張**。 */
+const DRAFT_BOX = { url: "../FormBox/LoadBox.aspx", id: "LoadBox", title: "草稿資料匣", w: "71" };
+
 /* 三顆唯讀查詢按鈕。id 與跳出來的資料頁都是實際點過確認的。 */
 export const QUERIES = {
   balance: { label: "可休時數", btn: "#btnDetail", page: "ESSF07_Detail.aspx" },
@@ -371,7 +390,7 @@ async function pickLeaveType({ page, fp, form, code }) {
 /* 按「草稿儲存」。
  * ⚠️ 只按草稿儲存，永遠不按旁邊那顆「傳送」（那個是送去簽核）。
  * 為什麼要存草稿：表單是同一個分頁，不存的話沒辦法接著填下一個人。 */
-async function saveDraft({ page, outer, notes, say = () => {} }) {
+export async function saveDraft({ page, outer, notes, say = () => {} }) {
   say("草稿儲存…");
   if (notes) notes.last = "";
   await outer.click(BTN_DRAFT, { force: true });
@@ -379,6 +398,106 @@ async function saveDraft({ page, outer, notes, say = () => {} }) {
   // 等那句話出現就好，不用死等 13 秒。
   const ok = await until(() => notes && /儲存成功|成功/.test(notes.last || ""), { timeout: 40000, page });
   if (!ok) throw new Error("按了草稿儲存但沒有看到「儲存成功」" + (notes && notes.last ? `（系統說：${notes.last}）` : "，可能沒存進去"));
+}
+
+/* 🚨 按「傳送」把表單送進簽核流程。**不可逆**。
+ * 只有在使用者明確選了「確定發送」時才會走到這裡。 */
+export async function sendForm({ page, outer, notes, say = () => {} }) {
+  say("傳送…");
+  if (notes) notes.last = "";
+  await outer.click(BTN_SEND, { force: true });
+
+  // 送出會經過一個「是否確定將填寫好的表單傳送出去?」的確認框（handler 自動接受），
+  // 然後才是結果。等到出現「不是那個確認框」的訊息，或表單被收掉為止。
+  await until(() => {
+    const m = (notes && notes.last) || "";
+    return m && !/是否確定|事後補假單/.test(m);
+  }, { timeout: 40000, page });
+
+  const msg = (notes && notes.last) || "";
+  // 沒填完的單系統會擋（例如「假別還沒有選喔~」），那不是成功
+  if (/還沒|不足|不存在|錯誤|失敗|請選|不可|無法/.test(msg)) {
+    throw new Error("EasyFlow 擋下來了：" + msg);
+  }
+  return msg;
+}
+
+/* 打開草稿資料匣，回傳目前所有草稿（用「填表日期時間」當識別）。 */
+export async function listDrafts({ page, tree, say = () => {} }) {
+  say("打開草稿資料匣…");
+  await tree.evaluate((b) => {
+    // eslint-disable-next-line no-undef
+    createTab(b.url, b.id, b.title, b.w);
+  }, DRAFT_BOX);
+  await page.waitForTimeout(3000);
+
+  const box = await until(() => {
+    const f = page.frames().find((x) => x.name() === "frameLoadBox" || x.url().includes("LoadBox.aspx"));
+    return f && !f.isDetached() ? f : null;
+  }, { timeout: 30000, page });
+  if (!box) throw new Error("草稿資料匣沒有開起來");
+
+  const rows = await until(async () => {
+    const r = await box.evaluate(() => {
+      // 用「填表日期時間」定位資料表 —— 篩選器那張表也含「主旨」，會抓錯
+      const t = Array.from(document.querySelectorAll("table")).find((x) => /填表日期時間/.test(x.innerText));
+      if (!t) return null;
+      return Array.from(t.querySelectorAll("tr"))
+        .map((tr) => Array.from(tr.querySelectorAll("td")).map((td) => (td.innerText || "").trim()))
+        .filter((c) => c.length >= 4 && /^\d{4}\/\d{2}\/\d{2}/.test(c[2] || ""))
+        .map((c) => ({ subject: c[1], when: c[2], formName: c[3] }));
+    });
+    return r || null;
+  }, { timeout: 25000, page });
+
+  return { box, rows: rows || [] };
+}
+
+/* 從草稿匣打開指定的那一張（用填表日期時間比對），回傳表單的 frame。 */
+async function openDraft({ page, box, when, say = () => {} }) {
+  say(`打開草稿 ${when}…`);
+  const cell = box.locator("td").filter({ hasText: when }).first();
+  if (!(await cell.count())) throw new Error(`草稿匣裡找不到 ${when} 這張`);
+  await cell.click({ force: true });
+  await page.waitForTimeout(3000);
+
+  const found = await until(() => {
+    const outer = page.frames().find((f) => /^frameESSF/.test(f.name() || ""));
+    if (!outer || outer.isDetached()) return null;
+    const fp = outer.childFrames().find((f) => f.name() === "framePlus");
+    return fp ? { outer, fp } : null;
+  }, { timeout: 40000, page });
+  if (!found) throw new Error(`草稿 ${when} 打不開`);
+  return found;
+}
+
+/* 🚨 把指定的幾張草稿送出去。**不可逆**。
+ * whens = 填表日期時間的陣列（listDrafts 回傳的那個 when）。 */
+export async function sendDrafts({ cfg, whens, say = () => {}, onEach = () => {}, session = null }) {
+  const ses = session || await login({ cfg, say });
+  const results = [];
+  try {
+    for (let i = 0; i < whens.length; i++) {
+      const when = whens[i];
+      const tag = `(${i + 1}/${whens.length})`;
+      try {
+        const { box } = await listDrafts({ page: ses.page, tree: ses.tree, say: () => {} });
+        const { outer } = await openDraft({ page: ses.page, box, when, say: (t) => say(`${tag} ${t}`) });
+        const msg = await sendForm({ page: ses.page, outer, notes: ses.notes, say: (t) => say(`${tag} ${t}`) });
+        const one = { when, ok: true, error: "", msg };
+        results.push(one); onEach(one);
+        say(`${tag} ✓ 已送出`);
+      } catch (e) {
+        const one = { when, ok: false, error: String(e && e.message ? e.message : e).slice(0, 200), msg: "" };
+        results.push(one); onEach(one);
+        say(`${tag} ✗ ${one.error}`);
+      }
+    }
+    return { browser: ses.browser, results };
+  } catch (e) {
+    if (!session && ses.browser) { try { await ses.browser.close(); } catch { /* ignore */ } }
+    throw e;
+  }
 }
 
 /* 批次代填：一次幫多位同事上同一種單。
@@ -393,6 +512,16 @@ export async function fillBatch({ cfg, req, say = () => {}, onEach = () => {} })
   // 只登入一次，之後每個人重開分頁就好（登入一次要 10 秒，7 個人就差 1 分鐘）
   const ses = await login({ cfg, say });
   const browser = ses.browser;
+
+  // 跑之前先記下草稿匣裡已經有哪些 —— 跑完再看一次，多出來的就是這批。
+  // 為什麼要這樣：草稿清單的「主旨」欄一律是「此欄不需填寫」，看不出是誰的，
+  // 只能靠「填表日期時間」辨識。用差集才不會誤送到使用者本來就有的舊草稿。
+  let before = [];
+  try {
+    const b = await listDrafts({ page: ses.page, tree: ses.tree, say: () => {} });
+    before = b.rows.map((r) => r.when);
+  } catch { /* 拿不到就算了，最後只是沒辦法提供「一起送出」 */ }
+
   try {
     for (let i = 0; i < req.people.length; i++) {
       const name = req.people[i];
@@ -450,7 +579,7 @@ export async function fillBatch({ cfg, req, say = () => {}, onEach = () => {} })
 
         await saveDraft({ page: ses.page, outer: tab.outer, notes: ses.notes, say: (t) => say(`${tag} ${t}`) });
 
-        const one = { name, no: who.no, dep: who.dep, hours, startT: usedST, endT: usedET, ok: true, error: "" };
+        const one = { name, no: who.no, dep: who.dep, hours, startT: usedST, endT: usedET, ok: true, error: "", draft: "" };
         results.push(one);
         onEach(one);
         say(`${tag} ✓ 已存草稿（${usedST}~${usedET}，${hours} 小時）`);
@@ -491,6 +620,19 @@ export async function fillBatch({ cfg, req, say = () => {}, onEach = () => {} })
         }
       }
     }
+    // 跑完看看多了哪些草稿，依時間排序後配給「有成功存檔」的人（順序一致）
+    try {
+      const a = await listDrafts({ page: ses.page, tree: ses.tree, say: () => {} });
+      const fresh = a.rows.map((r) => r.when).filter((w) => !before.includes(w)).sort();
+      const okOnes = results.filter((r) => r.ok);
+      if (fresh.length === okOnes.length) {
+        okOnes.forEach((r, i) => { r.draft = fresh[i]; });
+      } else {
+        // 數量對不上就不要亂配 —— 寧可不給「一起送出」，也不能送錯人的單
+        say(`草稿匣多了 ${fresh.length} 張、成功 ${okOnes.length} 位，數量對不上，這批不提供一起送出`);
+      }
+    } catch { /* 拿不到就沒有 draft 欄位，UI 會自動不顯示送出 */ }
+
     return { browser, results };
   } catch (e) {
     if (browser) { try { await browser.close(); } catch { /* ignore */ } }
@@ -569,11 +711,14 @@ export async function fillLeave({ cfg, req, say = () => {} }) {
       ? `EasyFlow 算不出時數：${why}。表單留在畫面上，你可以直接改再按「計算」。`
       : "EasyFlow 算出來是 0 小時，那個時段沒有需要請假的上班時間 —— 可能是假日、國定假日/連假，或那天的班表還沒產生。表單留在畫面上，你可以直接改日期再按「計算」。");
     err.keepBrowser = browser;    // 讓呼叫方知道視窗要留著
+    err.session = { page, outer: ses.outer, notes: ses.notes };
     err.shot = shot;
     throw err;
   }
 
-  return { browser, typeName, hours, days, shot };
+  // page / outer / notes 一起回傳：填完之後使用者要選「確定發送 / 儲存草稿 / 取消」，
+  // 那些操作都要在這張還開著的表單上做。
+  return { browser, page, outer: ses.outer, notes: ses.notes, typeName, hours, days, shot };
 }
 
 /* 唯讀查詢：點三顆按鈕之一，把跳出來的表格讀成 cols + rows。
