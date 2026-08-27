@@ -261,26 +261,41 @@
   }
   footer .sp { margin-left: auto; }
 
-  /* ── 接上線的那一刻：整個視窗的邊框繞一圈 AI 彩光 ──────────────────
-     跟數據網站那邊同時亮（網站是 .blg，用色與掃動一模一樣），
-     做出「兩邊接上線」的感覺。conic 漸層用 mask 把中間挖掉，只留邊框那幾 px。
+  /* ── 接上線的那一刻：邊框跑一圈流動光帶 ────────────────────────────
+     跟數據網站那邊同時亮（網站是 .blg，參數算法在那邊的 app/_trace.js，
+     下面的 traceSprites() 是它的孿生版本 —— 改一邊要記得改另一邊）。
+
+     ⚠️ 前面試過兩種都被退：
+     ① conic 漸層 + mask 挖出來的環：邊緣硬切，整圈同時亮，看不出起終點。
+     ② 圓形粒子沿路徑跑：變成「一顆一顆光球在跑」，不連續。
+     現在是**拉長的橢圓**，offset-rotate: auto 跟著路徑轉，前後排很密且互相重疊
+     → 合起來是一條連續、邊緣不規則的流動光帶，頭白熱、往尾巴平滑變暗。
+
+     位移與轉向都交給 offset-path（它走 transform），所以**不要**再寫 transform。
      純視覺、pointer-events: none，不會擋到任何按鈕。 */
-  @property --cvA { syntax: "<angle>"; inherits: false; initial-value: 0deg; }
-  .glow { position: fixed; inset: 0; z-index: 99; pointer-events: none; opacity: 0; }
-  .glow.on { animation: glowIn .45s ease forwards, glowOut .9s ease 2.55s forwards; }
-  .glow::before, .glow i {
-    content: ""; position: absolute; inset: 0; display: block;
-    background: conic-gradient(from var(--cvA), #ff9f0a, #ff375f, #bf5af2, #5e5ce6, #0a84ff, #64d2ff, #2bd1c0, #ff9f0a);
-    animation: cvSweep 2.4s linear infinite;
-    -webkit-mask: linear-gradient(#000 0 0) content-box, linear-gradient(#000 0 0);
-    mask: linear-gradient(#000 0 0) content-box, linear-gradient(#000 0 0);
-    -webkit-mask-composite: xor; mask-composite: exclude;
+  .glow { position: fixed; inset: 0; z-index: 99; pointer-events: none; }
+  .glow span {
+    position: absolute; left: 0; top: 0; display: block;
+    width: var(--l); height: var(--t); border-radius: 50%;
+    /* ⚠️ 刻意用**實心**顏色，不要 radial-gradient：漸層到透明的話每顆自己
+       就是一個亮點、邊緣自己收掉 → 看起來是「一堆光球」。實心 + blur 才會
+       互相融成一條連續的光帶。 */
+    background: var(--c);
+    filter: blur(var(--b));
+    offset-rotate: auto;
+    opacity: 0;
+    animation: fwTrace var(--d) cubic-bezier(.42, .02, .5, .98) var(--dl) forwards,
+               fwSpark var(--d) linear var(--dl) forwards;
+    will-change: offset-distance, opacity;
   }
-  .glow::before { padding: 10px; filter: blur(13px) saturate(1.45); opacity: .55; }   /* 外擴柔光 */
-  .glow i { padding: 2px; }                                                           /* 貼邊細霓虹線 */
-  @keyframes cvSweep { to { --cvA: 360deg; } }
-  @keyframes glowIn { from { opacity: 0; } to { opacity: 1; } }
-  @keyframes glowOut { from { opacity: 1; } to { opacity: 0; } }
+  @keyframes fwTrace { from { offset-distance: 0%; } to { offset-distance: 100%; } }
+  @keyframes fwSpark {
+    0% { opacity: 0; }
+    5% { opacity: var(--o); }
+    80% { opacity: var(--o); }
+    100% { opacity: 0; }
+  }
+  @media (prefers-reduced-motion: reduce) { .glow { display: none; } }
 
   ::-webkit-scrollbar { width: 8px; }
   ::-webkit-scrollbar-track { background: transparent; }
@@ -298,7 +313,7 @@
   <div class="pill" id="pill"><span class="dot"></span><span id="pillTxt">啟動中</span></div>
 </header>
 
-<div class="glow" id="glow" aria-hidden="true"><i></i></div>
+<div class="glow" id="glow" aria-hidden="true"></div>
 <main id="main"></main>
 <footer id="footer"></footer>
 
@@ -520,14 +535,93 @@ function drawRunning(st) {
   }
 }
 
-/* 接上線時放一次邊框光。重播要先把 class 拿掉、強制 reflow，否則同一個動畫不會再跑。 */
+/* ── 接上線那一圈流動光帶 ────────────────────────────────────────────
+   ⚠️ 這是數據網站 app/_trace.js 的孿生版本（兩邊要長得一樣，改一邊記得改另一邊）。
+   做法：每顆都是拉長的橢圓，沿邊框路徑跑一圈，排很密且互相重疊 → 連續的光帶；
+   亮度從頭（白熱）平滑遞減到尾巴。 */
+const HUES = [[255,159,10],[255,55,95],[191,90,242],[94,92,230],[10,132,255],[100,210,255],[43,209,192]];
+const LAP = 2700, BODY = 92, SPREAD = 760, CORNER = 20;
+
+function hue(k, alpha, white) {
+  const x = k * (HUES.length - 1);
+  const i = Math.min(HUES.length - 2, Math.floor(x));
+  const f = x - i;
+  const c = HUES[i].map((v, n) => {
+    const base = v + (HUES[i + 1][n] - v) * f;
+    return Math.round(base + (255 - base) * (white || 0));
+  });
+  return `rgba(${c[0]}, ${c[1]}, ${c[2]}, ${alpha})`;
+}
+
+function traceSprites(w, h) {
+  // 路徑往內縮 5px：光帶是以路徑為中心畫的，貼邊會有一半跑到畫面外被裁掉
+  const IN = 5, r = CORNER;
+  const cx = Math.round(w / 2), L = IN, T = IN, R = w - IN, B = h - IN;
+  const path = `path('M ${cx} ${T} H ${R - r} A ${r} ${r} 0 0 1 ${R} ${T + r}`
+    + ` V ${B - r} A ${r} ${r} 0 0 1 ${R - r} ${B}`
+    + ` H ${L + r} A ${r} ${r} 0 0 1 ${L} ${B - r}`
+    + ` V ${T + r} A ${r} ${r} 0 0 1 ${L + r} ${T} Z')`;
+  const rnd = (a, z) => a + Math.random() * (z - a);
+  const out = [];
+  const push = (p) => out.push({ path, ...p });
+
+  // 頭：外擴柔光 → 亮核心 → 白熱尖端
+  push({ l: 168, t: 56, b: 21, c: "rgba(130, 205, 255, .5)", o: .6, dl: 0, d: LAP });
+  push({ l: 112, t: 19, b: 8, c: "rgba(185, 230, 255, .95)", o: .95, dl: 0, d: LAP });
+  push({ l: 62, t: 9, b: 3.5, c: "rgba(235, 248, 255, 1)", o: 1, dl: 0, d: LAP });
+  push({ l: 34, t: 4.5, b: 1.5, c: "rgba(255, 255, 255, 1)", o: 1, dl: 0, d: LAP });
+
+  // 主體：等距重疊成連續光帶；厚度用平滑波動（亂抖會一顆一顆凸出來）
+  for (let i = 0; i < BODY; i++) {
+    const k = i / (BODY - 1), fall = Math.pow(1 - k, 1.7);
+    const wave = 1 + .2 * Math.sin(i * .55) + .11 * Math.sin(i * 1.7 + 1.2);
+    push({
+      l: 72 + 52 * (1 - k),
+      t: (1.9 + 4.6 * (1 - k)) * wave,
+      b: 1.8 + 5 * k,
+      c: hue(k, 1, Math.pow(1 - k, 3) * .5),
+      o: .22 + .7 * fall,
+      dl: k * SPREAD,
+      d: LAP,
+    });
+  }
+  // 水霧：更寬更淡，讓光帶有厚度
+  for (let i = 0; i < 12; i++) {
+    const k = i / 11;
+    push({
+      l: rnd(140, 250), t: rnd(13, 27), b: rnd(10, 18),
+      c: hue(k, .55, Math.pow(1 - k, 2) * .6),
+      o: (.12 + .3 * Math.pow(1 - k, 1.5)) * rnd(.85, 1),
+      dl: k * SPREAD * .9 + rnd(-40, 40),
+      d: LAP + rnd(-120, 120),
+    });
+  }
+  return out;
+}
+
 let wasOnline = false;
+let glowTimer = null;
 function playGlow() {
   const g = document.getElementById("glow");
   if (!g) return;
-  g.classList.remove("on");
-  void g.offsetWidth;
-  g.classList.add("on");
+  g.innerHTML = "";
+  /* ⚠️ 一定要用 DOM 建，不要組 HTML 字串：路徑是 path('M …')，
+     塞進 style="…" 屬性裡引號會打架，整個 style 被截斷 —— 症狀是粒子有生出來
+     但完全不動（offset-distance 一直是 0）。踩過。 */
+  for (const p of traceSprites(window.innerWidth, window.innerHeight)) {
+    const el = document.createElement("span");
+    el.style.offsetPath = p.path;
+    el.style.setProperty("--l", p.l.toFixed(1) + "px");
+    el.style.setProperty("--t", p.t.toFixed(1) + "px");
+    el.style.setProperty("--b", p.b.toFixed(1) + "px");
+    el.style.setProperty("--c", p.c);
+    el.style.setProperty("--o", p.o.toFixed(2));
+    el.style.setProperty("--dl", Math.max(0, Math.round(p.dl)) + "ms");
+    el.style.setProperty("--d", Math.round(p.d) + "ms");
+    g.appendChild(el);
+  }
+  clearTimeout(glowTimer);
+  glowTimer = setTimeout(() => { g.innerHTML = ""; }, LAP + SPREAD + 700);
 }
 
 /* ── 狀態列 ── */
