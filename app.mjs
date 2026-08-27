@@ -305,11 +305,21 @@ function openWindow(port) {
     spawn("cmd", ["/c", "start", "", `http://127.0.0.1:${port}/`], { detached: true, stdio: "ignore", windowsHide: true }).unref();
     return;
   }
-  // ⚠️ 不能用 spawn 出來的行程來判斷視窗死活：Edge/Chrome 啟動後會自己重新
-  // fork 一份，原本那個行程立刻結束，於是 exit 事件會馬上誤觸發。
-  // 改成看「介面有沒有在跟我要狀態」——關窗時它會打 /bye，這是最準的；
-  // 萬一 /bye 沒送到（當掉、強制關閉），心跳逾時當後備。
-  spawn(exe, args, { stdio: "ignore", windowsHide: true }).unref();
+  /* 🚨 這裡**絕對不能加 windowsHide: true**。
+   * 那個選項在 Windows 上是把 SW_HIDE 寫進 STARTUPINFO，而 Chrome/Edge 會照做 ——
+   * 瀏覽器行程有起來、但視窗是隱藏的，畫面上什麼都沒有。
+   * 這就是「要點兩次才會開」的真正原因：第一次點，服務起來了、視窗卻是隱的；
+   * 第二次點的時候，新的瀏覽器行程是去叫「已經在跑的那個瀏覽器實例」開視窗，
+   * 那條路不吃 STARTUPINFO，所以視窗才冒出來。
+   * 實測（同一台機器、同一份程式，只差這個選項）：
+   *   windowsHide: true  → 等 10 秒都沒有任何視窗
+   *   拿掉             → 2 秒就出現「EasyFlow 橋接」
+   *
+   * ⚠️ 另外：不能用 spawn 出來的行程來判斷視窗死活 —— Edge/Chrome 啟動後會自己
+   * 重新 fork 一份，原本那個行程立刻結束，exit 事件會馬上誤觸發。
+   * 改成看「介面有沒有在跟我要狀態」：關窗時它會打 /bye，這是最準的；
+   * 萬一 /bye 沒送到（當掉、強制關閉），心跳逾時當後備。 */
+  spawn(exe, args, { stdio: "ignore" }).unref();
 
   lastPing = Date.now();
   setInterval(() => {
