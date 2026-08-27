@@ -540,7 +540,11 @@ function drawRunning(st) {
    做法：每顆都是拉長的橢圓，沿邊框路徑跑一圈，排很密且互相重疊 → 連續的光帶；
    亮度從頭（白熱）平滑遞減到尾巴。 */
 const HUES = [[255,159,10],[255,55,95],[191,90,242],[94,92,230],[10,132,255],[100,210,255],[43,209,192]];
-const LAP = 2700, BODY = 92, SPREAD = 760, CORNER = 20;
+const LAP = 2700, BODY = 130, SPREAD = 760;
+/* 轉角圓弧半徑。⚠️ 太小會出現「十字交叉」：粒子是長橢圓，轉角弧長太短的話，
+   前一顆還是橫的、後一顆已經是直的，在角落交叉成十字，看起來斷掉。
+   半徑跟著視窗大小走，弧長才會遠大於粒子長度。 */
+const cornerFor = (w, h) => Math.max(26, Math.min(90, Math.min(w, h) * .1));
 
 function hue(k, alpha, white) {
   const x = k * (HUES.length - 1);
@@ -555,7 +559,7 @@ function hue(k, alpha, white) {
 
 function traceSprites(w, h) {
   // 路徑往內縮 5px：光帶是以路徑為中心畫的，貼邊會有一半跑到畫面外被裁掉
-  const IN = 5, r = CORNER;
+  const IN = 5, r = Math.round(cornerFor(w, h));
   const cx = Math.round(w / 2), L = IN, T = IN, R = w - IN, B = h - IN;
   const path = `path('M ${cx} ${T} H ${R - r} A ${r} ${r} 0 0 1 ${R} ${T + r}`
     + ` V ${B - r} A ${r} ${r} 0 0 1 ${R - r} ${B}`
@@ -566,17 +570,17 @@ function traceSprites(w, h) {
   const push = (p) => out.push({ path, ...p });
 
   // 頭：外擴柔光 → 亮核心 → 白熱尖端
-  push({ l: 168, t: 9, b: 7, c: "rgba(130, 205, 255, .5)", o: .48, dl: 0, d: LAP });
-  push({ l: 112, t: 2.2, b: 2, c: "rgba(185, 230, 255, .95)", o: .95, dl: 0, d: LAP });
-  push({ l: 62, t: 1.1, b: 1, c: "rgba(235, 248, 255, 1)", o: 1, dl: 0, d: LAP });
-  push({ l: 34, t: .6, b: .6, c: "rgba(255, 255, 255, 1)", o: 1, dl: 0, d: LAP });
+  push({ l: 66, t: 9, b: 7, c: "rgba(130, 205, 255, .5)", o: .48, dl: 0, d: LAP });
+  push({ l: 48, t: 2.2, b: 2, c: "rgba(185, 230, 255, .95)", o: .95, dl: 0, d: LAP });
+  push({ l: 32, t: 1.1, b: 1, c: "rgba(235, 248, 255, 1)", o: 1, dl: 0, d: LAP });
+  push({ l: 20, t: .6, b: .6, c: "rgba(255, 255, 255, 1)", o: 1, dl: 0, d: LAP });
 
   // 主體：等距重疊成連續光帶；厚度用平滑波動（亂抖會一顆一顆凸出來）
   for (let i = 0; i < BODY; i++) {
     const k = i / (BODY - 1), fall = Math.pow(1 - k, 1.7);
     const wave = 1 + .2 * Math.sin(i * .55) + .11 * Math.sin(i * 1.7 + 1.2);
     push({
-      l: 72 + 52 * (1 - k),
+      l: 26 + 20 * (1 - k),
       t: (0.2 + 0.45 * (1 - k)) * wave,
       b: 0.9 + 2.2 * k,
       c: hue(k, 1, Math.pow(1 - k, 3) * .5),
@@ -589,7 +593,7 @@ function traceSprites(w, h) {
   for (let i = 0; i < 12; i++) {
     const k = i / 11;
     push({
-      l: rnd(140, 250), t: rnd(2, 5), b: rnd(6, 10),
+      l: rnd(52, 96), t: rnd(2, 5), b: rnd(6, 10),
       c: hue(k, .55, Math.pow(1 - k, 2) * .6),
       o: (.12 + .3 * Math.pow(1 - k, 1.5)) * rnd(.85, 1),
       dl: k * SPREAD * .9 + rnd(-40, 40),
