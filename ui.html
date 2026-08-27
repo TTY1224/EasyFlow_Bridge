@@ -219,6 +219,23 @@
   .who span { color: var(--text-3); font-size: 10px; font-weight: 700; letter-spacing: .1em; text-transform: uppercase; }
   .who b { color: var(--text-1); font-weight: 500; -webkit-user-select: text; user-select: text; }
 
+  /* 有新版：橫幅（黃邊，跟「已上線」同一套語言，不用彈窗嚇人） */
+  .upd {
+    display: flex; align-items: center; gap: 10px;
+    padding: 10px 13px; margin-bottom: 12px; border-radius: var(--r-md);
+    background: rgba(234, 255, 0, .06); border: 1px solid rgba(234, 255, 0, .3);
+    font-size: 12px; color: var(--text-2); line-height: 1.6;
+  }
+  .upd b { color: var(--fw-yellow); font-weight: 700; }
+  .upd .go {
+    margin-left: auto; flex: 0 0 auto;
+    padding: 6px 14px; border: 0; border-radius: var(--r-sm);
+    background: var(--fw-yellow); color: #14140f; font-size: 11px; font-weight: 700;
+  }
+  .upd .go:hover { background: #f5ff5a; }
+  .upd .go:disabled { opacity: .6; }
+  .ver { margin-left: 10px; font-size: 10px; color: var(--text-3); letter-spacing: .04em; }
+
   /* 動態：預設收起來，想看的人自己點開 */
   .logt {
     display: flex; align-items: center; gap: 9px; width: 100%;
@@ -440,6 +457,7 @@ function drawRunning(st) {
   if (view !== "running") {
     view = "running";
     document.getElementById("main").innerHTML = `
+      <div id="updBar"></div>
       <div class="glass who">
         <div><span>你的帳號</span><b>${esc(st.config.email || "")}</b></div>
         <div><span>EasyFlow</span><b>${esc(st.config.easyflowUser || "")}</b></div>
@@ -451,6 +469,7 @@ function drawRunning(st) {
       <div class="log" id="log" hidden></div>`;
     document.getElementById("footer").innerHTML = `
       <button class="ghost" id="reset">重新設定</button>
+      <span class="ver">v${esc(st.update?.current || "")}</span>
       <button class="ghost sp" id="quit">結束</button>`;
     document.getElementById("reset").onclick = () => {
       if (confirm("重新設定？\n\n現在的設定會被清掉，要重新輸入帳號密碼。")) { api("/setup-reset", { wipe: true }); view = ""; }
@@ -521,6 +540,7 @@ function drawRunning(st) {
 
     logCount = -1;
   }
+  drawUpdate(st);
   if (syncBrowser) syncBrowser(st.config.browser);
   if (st.log.length !== logCount) {
     logCount = st.log.length;
@@ -626,6 +646,38 @@ function playGlow() {
   }
   clearTimeout(glowTimer);
   glowTimer = setTimeout(() => { g.innerHTML = ""; }, LAP + SPREAD + 700);
+}
+
+/* 有新版就在最上面顯示一條橫幅。按下去就交給後端下載＋覆蓋＋重開。
+   ⚠️ 只有「執行中」畫面會有 #updBar，設定/檢查中的畫面沒有。 */
+let updShown = "";
+function drawUpdate(st) {
+  const bar = document.getElementById("updBar");
+  if (!bar) return;
+  const u = st.update || {};
+  const key = `${u.latest}|${u.busy}|${u.msg}`;
+  if (key === updShown) return;                 // 沒變就不要重畫（會把按鈕狀態洗掉）
+  updShown = key;
+
+  if (u.busy) {
+    bar.innerHTML = `<div class="upd"><span class="spin">◐</span>
+      <span>${esc(u.msg || "更新中…")}</span></div>`;
+    return;
+  }
+  if (!u.latest) {
+    // 沒有新版：只有更新失敗時要把訊息留著讓人看到
+    bar.innerHTML = u.msg ? `<div class="upd"><span>${esc(u.msg)}</span></div>` : "";
+    return;
+  }
+  bar.innerHTML = `<div class="upd">
+    <span>有新版本 <b>v${esc(u.latest)}</b>（你現在是 v${esc(u.current || "?")}）</span>
+    <button type="button" class="go" id="updGo">立即更新</button>
+  </div>`;
+  document.getElementById("updGo").onclick = (e) => {
+    e.target.disabled = true;
+    e.target.textContent = "更新中…";
+    api("/update", {});
+  };
 }
 
 /* ── 狀態列 ── */

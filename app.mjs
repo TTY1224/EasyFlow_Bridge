@@ -38,9 +38,18 @@ const S = {
   config: {},
   setup: { steps: [], error: "" },
   log: [],
+  // 自動更新：current＝現在跑的版本、latest＝GitHub 上最新的、
+  // busy＝正在下載、msg＝進度或錯誤（畫面照這個顯示橫幅）
+  update: { current: "", latest: "", url: "", notes: "", busy: false, msg: "" },
 };
 const LOG_MAX = 200;
 const pushLog = (l) => { S.log.push(l); if (S.log.length > LOG_MAX) S.log.splice(0, S.log.length - LOG_MAX); };
+
+// 自己的版本（package.json）。⚠️ 發版時記得跟著 tag 一起改，不然使用者會被一直提示更新。
+const VERSION = (() => {
+  try { return String(JSON.parse(fs.readFileSync(path.join(HERE, "package.json"), "utf8")).version || "0.0.0"); }
+  catch { return "0.0.0"; }
+})();
 
 let bridge = null;
 // ⚠️ 這是「bridge 正在用的那個 cfg 物件本身」（不是複本）。
@@ -236,6 +245,8 @@ const server = http.createServer(async (req, res) => {
       return send(500, JSON.stringify({ ok: false, error: String(e?.message || e) }));
     }
   }
+  if (url === "/update") { runUpdate(); return send(200, JSON.stringify({ ok: true })); }
+  if (url === "/check-update") { await checkUpdate(); return send(200, JSON.stringify({ ok: true, update: S.update })); }
   if (url === "/quit") { send(200, JSON.stringify({ ok: true })); return shutdown(); }
 
   send(404, JSON.stringify({ error: "not found" }));
@@ -268,6 +279,11 @@ server.listen(Number(process.env.EFBRIDGE_PORT) || 0, "127.0.0.1", () => {
   // （讀設定要解密、驗授權碼要打伺服器、Realtime 要連上），
   // 中間毫無反應，大家都以為沒點到就再點一次。
   openWindow(port);
+
+  // 檢查更新：開機一次，之後每 6 小時（unref：不要因為這個計時器讓程式關不掉）
+  S.update.current = VERSION;
+  setTimeout(checkUpdate, 4000);
+  setInterval(checkUpdate, 6 * 3600 * 1000).unref();
 
   // 有設定就接著連線（畫面會自己從「連線中」變「已上線」）；沒設定就停在設定畫面
   if (!cfgStore.exists()) { S.screen = "setup"; return; }
@@ -326,6 +342,42 @@ function openWindow(port) {
     // 給到 2 分鐘：視窗最小化時瀏覽器會把計時器降頻，太短會誤殺。
     if (Date.now() - lastPing > 120000) shutdown();
   }, 15000).unref();
+}
+
+/* 問一下 GitHub 有沒有新版。安靜失敗 —— 檢查不到不該吵使用者。 */
+async function checkUpdate() {
+  try {
+    const { checkLatest } = await import("./update.mjs");
+    const r = await checkLatest(VERSION);
+    if (!r) return;
+    S.update = { ...S.update, latest: r.newer ? r.version : "", url: r.url, notes: r.notes };
+    if (r.newer) pushLog({ text: `有新版本 v${r.version}（你現在是 v${VERSION}），可以在上面按更新`, kind: "task", at: Date.now() });
+  } catch { /* 沒網路就算了 */ }
+}
+
+/* 使用者按下「立即更新」。下載 → 解壓 → 交給 updater.bat → 自己退場。 */
+async function runUpdate() {
+  if (S.update.busy) return;
+  // ⚠️ S.busy（core 回報的），不是 core 裡面那個 busy —— 這裡沒有那個變數
+  if (S.busy) { S.update.msg = "正在處理請假的工作，等它跑完再更新"; return; }
+  if (!S.update.url) { S.update.msg = "沒有可以更新的版本"; return; }
+  S.update.busy = true;
+  S.update.msg = "準備更新…";
+  try {
+    const { download, handOff } = await import("./update.mjs");
+    const src = await download(S.update.url, (m) => { S.update.msg = m; });
+    S.update.msg = "即將重新啟動…";
+    pushLog({ text: "更新檔下載完成，準備覆蓋並重開", kind: "ok", at: Date.now() });
+    // 先把橋接停掉（Realtime 連線、瀏覽器），再交棒
+    try { await bridge?.stop(); } catch { /* ignore */ }
+    handOff({ src, dst: HERE, pid: process.pid, onLog: (t) => pushLog({ text: t, kind: "info", at: Date.now() }) });
+    clearLock();
+    setTimeout(() => process.exit(0), 1200);
+  } catch (e) {
+    S.update.busy = false;
+    S.update.msg = "更新失敗：" + String(e?.message || e).slice(0, 160);
+    pushLog({ text: S.update.msg, kind: "err", at: Date.now() });
+  }
 }
 
 async function shutdown() {

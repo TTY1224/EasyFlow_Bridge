@@ -39,6 +39,7 @@ $files = @(
   "bridge.mjs",      # 命令列版（進階／mprocs 用）
   "core.mjs",
   "easyflow.mjs",
+  "update.mjs",      # 自動更新（漏掉的話，更新完就沒有更新功能了）
   "config.mjs",
   "verify.mjs",
   "setup.mjs",
