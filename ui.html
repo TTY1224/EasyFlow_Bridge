@@ -566,10 +566,10 @@ function traceSprites(w, h) {
   const push = (p) => out.push({ path, ...p });
 
   // 頭：外擴柔光 → 亮核心 → 白熱尖端
-  push({ l: 168, t: 13, b: 9, c: "rgba(130, 205, 255, .5)", o: .5, dl: 0, d: LAP });
-  push({ l: 112, t: 3.6, b: 3, c: "rgba(185, 230, 255, .95)", o: .95, dl: 0, d: LAP });
-  push({ l: 62, t: 1.8, b: 1.5, c: "rgba(235, 248, 255, 1)", o: 1, dl: 0, d: LAP });
-  push({ l: 34, t: .9, b: .8, c: "rgba(255, 255, 255, 1)", o: 1, dl: 0, d: LAP });
+  push({ l: 168, t: 9, b: 7, c: "rgba(130, 205, 255, .5)", o: .48, dl: 0, d: LAP });
+  push({ l: 112, t: 2.2, b: 2, c: "rgba(185, 230, 255, .95)", o: .95, dl: 0, d: LAP });
+  push({ l: 62, t: 1.1, b: 1, c: "rgba(235, 248, 255, 1)", o: 1, dl: 0, d: LAP });
+  push({ l: 34, t: .6, b: .6, c: "rgba(255, 255, 255, 1)", o: 1, dl: 0, d: LAP });
 
   // 主體：等距重疊成連續光帶；厚度用平滑波動（亂抖會一顆一顆凸出來）
   for (let i = 0; i < BODY; i++) {
@@ -577,10 +577,10 @@ function traceSprites(w, h) {
     const wave = 1 + .2 * Math.sin(i * .55) + .11 * Math.sin(i * 1.7 + 1.2);
     push({
       l: 72 + 52 * (1 - k),
-      t: (0.35 + 0.85 * (1 - k)) * wave,
-      b: 1.6 + 3.4 * k,
+      t: (0.2 + 0.45 * (1 - k)) * wave,
+      b: 0.9 + 2.2 * k,
       c: hue(k, 1, Math.pow(1 - k, 3) * .5),
-      o: .3 + .85 * fall,
+      o: .36 + .95 * fall,
       dl: k * SPREAD,
       d: LAP,
     });
@@ -589,7 +589,7 @@ function traceSprites(w, h) {
   for (let i = 0; i < 12; i++) {
     const k = i / 11;
     push({
-      l: rnd(140, 250), t: rnd(3, 7), b: rnd(7, 12),
+      l: rnd(140, 250), t: rnd(2, 5), b: rnd(6, 10),
       c: hue(k, .55, Math.pow(1 - k, 2) * .6),
       o: (.12 + .3 * Math.pow(1 - k, 1.5)) * rnd(.85, 1),
       dl: k * SPREAD * .9 + rnd(-40, 40),
