@@ -60,7 +60,9 @@ export async function startBridge({ cfg, onLog = () => {}, onState = () => {} })
     safeEq(hmac([p.requestId, p.ts, p.email, "s", p.drafts.join(",")].join("|")), p.sig);
 
   const supa = createClient(conn.supabaseUrl, conn.supabaseKey, { realtime: { params: { eventsPerSecond: 20 } } });
-  const channel = supa.channel(conn.channel, { config: { broadcast: { self: false }, presence: { key: "bridge" } } });
+  const newChannel = () => supa.channel(conn.channel,
+    { config: { broadcast: { self: false }, presence: { key: "bridge" } } });
+  let channel = newChannel();
   const emit = (event, payload) => { try { channel.send({ type: "broadcast", event, payload }); } catch { /* 還沒連上 */ } };
 
   let busy = false;
@@ -258,6 +260,58 @@ export async function startBridge({ cfg, onLog = () => {}, onState = () => {} })
     }
   }
 
+  /* ── 斷線重連 ───────────────────────────────────────────────────────
+   * 使用者下班掛著整晚，實際 log 長這樣：
+   *   18:50 CHANNEL_ERROR → 18:50 已上線（2 秒後自己回來）
+   *   21:06 CHANNEL_ERROR → 21:06 已上線
+   *   03:10 CHANNEL_ERROR → （沒有然後了，就這樣斷著）
+   * 也就是：supabase-js 大多數時候會自己重連，但**偶爾會回不來**，
+   * 而且訊息還寫「檢查網路後重開」—— 網路根本沒斷，只是嚇人。
+   *
+   * 所以這裡自己顧一層：
+   *   ① 斷線只說「重連中」，不要叫人重開
+   *   ② 15 秒還沒回來就**整條頻道重建**（removeChannel + 重新 subscribe）
+   *   ③ 每 60 秒巡一次，狀態不是 joined 就重建（睡眠喚醒、網路換手都靠這個）
+   *   ④ 退避：5s → 10s → 20s → 30s → 60s 封頂，然後一直試下去，不放棄
+   */
+  let online = false;
+  let attempts = 0;
+  let retryTimer = null;
+  let downSince = 0;
+
+  const clearRetry = () => { if (retryTimer) { clearTimeout(retryTimer); retryTimer = null; } };
+
+  function scheduleRetry() {
+    if (stopped || retryTimer) return;
+    const wait = [5000, 10000, 20000, 30000][Math.min(attempts, 3)] || 60000;
+    attempts += 1;
+    retryTimer = setTimeout(() => { retryTimer = null; rebuild(); }, wait);
+  }
+
+  /* 整條頻道砍掉重練。⚠️ 一定要 removeChannel 舊的，
+     否則同一個 client 上會留著一條殭屍頻道，事件會被處理兩次。 */
+  function rebuild() {
+    if (stopped) return;
+    try { supa.removeChannel(channel); } catch { /* 本來就壞了 */ }
+    try { supa.realtime?.connect?.(); } catch { /* 有些版本沒有這個方法 */ }
+    channel = newChannel();
+    wire();
+  }
+
+  function onDown(why) {
+    if (stopped || !online && downSince) { scheduleRetry(); return; }
+    online = false;
+    downSince = downSince || Date.now();
+    onState({ status: "offline" });
+    const mins = Math.floor((Date.now() - downSince) / 60000);
+    // 只有真的一直連不上才講重話 —— 平常那 2 秒的閃斷不該嚇人
+    log(mins >= 2 ? `已經 ${mins} 分鐘連不上即時通道（${why}），還在重試。網路正常的話通常會自己回來。`
+                  : `連線中斷（${why}），重連中…`, mins >= 2 ? "err" : "warn");
+    scheduleRetry();
+  }
+
+  /* 把所有事件掛上去並訂閱。重連時會整個再跑一次。 */
+  function wire() {
   channel
     .on("broadcast", { event: "a" }, ({ payload }) => {
       if (!verifyAct(payload)) { log("收到簽章無效的操作請求，已忽略", "warn"); return; }
@@ -297,24 +351,48 @@ export async function startBridge({ cfg, onLog = () => {}, onState = () => {} })
         try { supa.removeChannel(channel); } catch { /* ignore */ }
       }
     })
-    .subscribe((s) => {
+    .subscribe((st) => {
       if (stopped) return;
-      if (s === "SUBSCRIBED") {
+      if (st === "SUBSCRIBED") {
         channel.track({ role: "bridge", at: Date.now(), pid: process.pid });
+        clearRetry();
+        attempts = 0;
+        const wasDown = downSince;
+        downSince = 0;
         onState({ status: "online" });
-        log("已上線，可以回網站找 Woby 講話了", "ok");
-      } else if (s === "CHANNEL_ERROR" || s === "TIMED_OUT") {
-        onState({ status: "offline" });
-        log("連不上即時通道（" + s + "）。檢查網路後重開。", "err");
+        // 斷過才報「回來了」，第一次上線用原本那句
+        log(wasDown ? "連線回來了，已上線" : "已上線，可以回網站找 Woby 講話了", "ok");
+        online = true;
+      } else if (st === "CHANNEL_ERROR" || st === "TIMED_OUT" || st === "CLOSED") {
+        onDown(st);
       }
     });
+  }
+
+  wire();
+
+  /* 巡邏：每分鐘看一次頻道到底是不是還活著。
+     ⚠️ 這條是給「沒有觸發任何事件就默默死掉」的情況用的 —— 筆電睡醒、
+     Wi-Fi 換手常常這樣，supabase-js 不一定會回報錯誤，狀態就一直卡在非 joined。 */
+  setInterval(() => {
+    if (stopped || busy) return;                 // 正在填單就別動連線
+    const st = String(channel?.state || "");
+    if (st === "joined") return;
+    if (!retryTimer) {
+      log(`偵測到頻道狀態是「${st || "unknown"}」，重新連線…`, "warn");
+      onDown("watchdog");
+    }
+  }, 60000).unref();
 
   return {
     email: conn.email,
     stop: async () => {
       stopped = true;
+      clearRetry();
       if (openBrowser) { try { await openBrowser.close(); } catch { /* ignore */ } }
       try { supa.removeChannel(channel); } catch { /* ignore */ }
     },
+    // 手動重連（視窗上的按鈕、或測試用）
+    reconnect: () => { clearRetry(); attempts = 0; rebuild(); },
   };
 }
