@@ -345,7 +345,12 @@ function openWindow(port) {
    * 重新 fork 一份，原本那個行程立刻結束，exit 事件會馬上誤觸發。
    * 改成看「介面有沒有在跟我要狀態」：關窗時它會打 /bye，這是最準的；
    * 萬一 /bye 沒送到（當掉、強制關閉），心跳逾時當後備。 */
-  spawn(exe, args, { stdio: "ignore" }).unref();
+  /* 🚨 detached 一定要加。沒有的話，瀏覽器是這個行程的子行程，
+   * **父行程一退場，Windows 會把它一起收掉**。
+   * 平常看不出來（橋接自己會一直活著），但「已經有一份在跑、第二次點啟動」那條路
+   * 是「開完視窗就 exit」—— 於是視窗閃一下就消失，使用者說「閃退、打不開」。
+   * 實測：沒有 detached 時，重新啟動後 4 秒和 12 秒去看，視窗數都是 0。 */
+  spawn(exe, args, { stdio: "ignore", detached: true }).unref();
 
   lastPing = Date.now();
   setInterval(() => {
@@ -406,13 +411,37 @@ function closeOurWindow(channel) {
 
 /* 切換瀏覽器：先用新的開一個視窗，等它真的活起來，再把舊的關掉。
    順序不能反 —— 先關舊的會有一瞬間畫面上什麼都沒有，使用者會以為當掉了。 */
+let switchSeq = 0;
+
 async function switchWindow(oldChannel, port) {
+  /* ⚠️ 使用者會連續快速點兩三下（Chrome→Edge→Chrome）。
+   * 每一次切換都是「開新的 → 等一下 → 關舊的」，前一次的「關舊的」很可能
+   * 剛好落在後一次「開新的」之後 —— 就把使用者眼前那個視窗關掉了。
+   * 實際回報：連點之後視窗整個消失，而且橋接還活著（於是再點啟動也只會閃一下）。
+   * 所以每次切換拿一個序號，被後來的切換接手就直接放棄關窗。 */
+  const me = ++switchSeq;
   switching = Date.now();
   const before = lastPing;
   openWindow(port);
   // 等新視窗來要狀態（最多 8 秒）。它一開始問，就代表畫面已經在了。
-  for (let i = 0; i < 32 && lastPing === before; i++) await new Promise((r) => setTimeout(r, 250));
+  for (let i = 0; i < 32 && lastPing === before; i++) {
+    if (me !== switchSeq) return;               // 有更新的切換了，交給它
+    await new Promise((r) => setTimeout(r, 250));
+  }
+  if (me !== switchSeq) return;
+  // 使用者又切回這個瀏覽器了 → 現在這個就是要留著的視窗，千萬不能關
+  if ((liveCfg?.browser === "chrome" ? "chrome" : "msedge") === oldChannel) return;
   await closeOurWindow(oldChannel);
+  /* 收尾自我檢查：關完之後如果沒有任何視窗在跟我要狀態，就補開一個。
+     這是最後一道保險 —— 使用者不該因為手速快就變成「橋接活著但沒有畫面」。 */
+  setTimeout(() => {
+    if (quitting || me !== switchSeq) return;
+    if (Date.now() - lastPing > 6000) {
+      pushLog({ text: "切換後沒看到視窗，補開一個", kind: "warn", at: Date.now() });
+      openWindow(port);
+    }
+  }, 6000);
+
   /* ⚠️ 這裡**不要**把 switching 歸零，讓那 15 秒的保護期自然過完。
    * 踩過：關掉舊視窗之後，它的 /bye（sendBeacon）會晚個幾百毫秒才送到，
    * 如果那時保護期已經被歸零，橋接就會以為「使用者關窗了」而整個關掉 ——
