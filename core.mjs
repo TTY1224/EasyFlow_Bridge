@@ -7,7 +7,7 @@
  */
 import { createClient } from "@supabase/supabase-js";
 import crypto from "node:crypto";
-import { fillLeave, runQuery, fillBatch, sendForm, saveDraft, sendDrafts, QUERIES, FORMS } from "./easyflow.mjs";
+import { fillLeave, runQuery, fillBatch, sendForm, saveDraft, sendDrafts, login, QUERIES, FORMS } from "./easyflow.mjs";
 import { checkToken } from "./verify.mjs";
 
 export async function startBridge({ cfg, onLog = () => {}, onState = () => {} }) {
@@ -52,6 +52,12 @@ export async function startBridge({ cfg, onLog = () => {}, onState = () => {} })
     p && p.sig && p.requestId && ["send", "draft", "cancel"].includes(p.action) &&
     Math.abs(Date.now() - Number(p.ts || 0)) <= 180000 &&
     safeEq(hmac([p.requestId, p.ts, p.email, "a", p.action].join("|")), p.sig);
+
+  // 「只幫我開 EasyFlow」。夾 "o" 當領域標記 —— 這條不填任何欄位，只登入。
+  const verifyOpen = (p) =>
+    p && p.sig && p.requestId &&
+    Math.abs(Date.now() - Number(p.ts || 0)) <= 180000 &&
+    safeEq(hmac([p.requestId, p.ts, p.email, "o"].join("|")), p.sig);
 
   // 批次的「一起送出」。草稿的識別（填表日期時間）也一起簽。
   const verifySend = (p) =>
@@ -185,6 +191,36 @@ export async function startBridge({ cfg, onLog = () => {}, onState = () => {} })
       finish(true, "");
     } catch (e) {
       finish(false, String(e && e.message ? e.message : e).slice(0, 250));
+    }
+  }
+
+  /* 只幫他把 EasyFlow 開起來並登入，然後**什麼都不做**。
+     使用者常常只是想進去看東西／自己手動填別的單，不想每次都重打帳密。 */
+  async function handleOpen(req) {
+    busy = true;
+    onState({ busy: true, task: "開 EasyFlow" });
+    const rid = String(req.requestId);
+    const say = (text) => { log("　" + text); emit("status", { requestId: rid, text }); };
+    try {
+      log("收到請求：幫我開 EasyFlow", "task");
+      // 已經有一張填好還沒處理的單開著 → 不要再開一個，同一個帳號重登會把那張踢掉
+      if (openBrowser) {
+        emit("opened", { requestId: rid, ok: true, already: true });
+        log("已經有一個 EasyFlow 視窗開著了，直接用那個就好", "ok");
+        return;
+      }
+      const ses = await login({ cfg, say });
+      openBrowser = ses.browser;      // 留著讓他自己用；下次填單前會自動關掉
+      pending = null;                 // 沒有表單，所以沒有「送出/存草稿」可按
+      emit("opened", { requestId: rid, ok: true, already: false });
+      log("已登入，EasyFlow 開在你電腦上了（要關就自己關那個視窗）", "ok");
+    } catch (e) {
+      const msg = String(e?.message || e).slice(0, 250);
+      emit("opened", { requestId: rid, ok: false, error: msg });
+      log("開不起來：" + msg, "err");
+    } finally {
+      busy = false;
+      onState({ busy: false, task: "" });
     }
   }
 
@@ -327,6 +363,11 @@ export async function startBridge({ cfg, onLog = () => {}, onState = () => {} })
       if (!verifyBatch(payload)) { log("收到簽章無效的批次請求，已忽略", "warn"); return; }
       if (busy) { emit("done", { requestId: payload.requestId, ok: false, error: "正在處理上一個請求，請稍候" }); return; }
       handleBatch(payload);
+    })
+    .on("broadcast", { event: "o" }, ({ payload }) => {
+      if (!verifyOpen(payload)) { log("收到簽章無效的開啟請求，已忽略", "warn"); return; }
+      if (busy) { emit("opened", { requestId: payload.requestId, ok: false, error: "正在處理上一個請求，請稍候" }); return; }
+      handleOpen(payload);
     })
     .on("broadcast", { event: "req" }, ({ payload }) => {
       if (!verifyFill(payload)) { log("收到簽章無效的填單請求，已忽略", "warn"); return; }
